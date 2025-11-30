@@ -105,7 +105,7 @@ class FDEPooler(Pooler):
                 self.final_proj.W = self.final_proj.W.half()
 
     def get_supported_tasks(self) -> set[PoolingTask]:
-        return {PoolingTask.EMBED}
+        return {"embed"}
 
     def get_pooling_updates(self, task: PoolingTask) -> PoolingParamsUpdate:
         return PoolingParamsUpdate()
