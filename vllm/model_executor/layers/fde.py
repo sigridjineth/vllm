@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from vllm.model_executor.layers.pooler import Pooler, PoolingParamsUpdate
 from vllm.tasks import PoolingTask
@@ -259,9 +260,35 @@ class FDEPooler(Pooler):
 
         # Final projection
         if self.final_proj:
-            return self.final_proj(flat)
+            output = self.final_proj(flat)
         else:
-            return flat
+            output = flat
+
+        # Apply normalization if requested in PoolingParams
+        # We assume all requests in the batch have the same normalization setting for now,
+        # or we handle it per request.
+        # pooling_metadata.pooling_params is a list of PoolingParams, one per request.
+        pooling_params = pooling_metadata.pooling_params
+        if pooling_params and any(p.normalize for p in pooling_params):
+            # If any request wants normalization, we normalize all for efficiency if they all want it.
+            # If mixed, we need to handle carefully.
+            # For simplicity and common use case (all requests same config), we check the first one
+            # or apply to all if generally enabled.
+            # Let's do per-row normalization if the corresponding param requests it.
+            
+            # Create a boolean mask for normalization
+            do_normalize = torch.tensor(
+                [p.normalize for p in pooling_params], device=output.device, dtype=torch.bool
+            )
+            
+            if do_normalize.all():
+                output = F.normalize(output, p=2, dim=-1)
+            elif do_normalize.any():
+                # Normalize only selected rows
+                normalized = F.normalize(output, p=2, dim=-1)
+                output = torch.where(do_normalize.unsqueeze(1), normalized, output)
+
+        return output
 
     def _project_block_batched(
         self, blocks: torch.Tensor, S: torch.Tensor | None
