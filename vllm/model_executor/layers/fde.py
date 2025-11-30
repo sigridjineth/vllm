@@ -23,7 +23,7 @@ class FDEConfig:
     fill_empty_clusters: bool = False
     seed: int = 42
     use_mixed_precision: bool = False
-    mode: str = "query"  # "query" or "doc"
+    use_mixed_precision: bool = False
 
 
 class BatchedParams(nn.Module):
@@ -90,7 +90,7 @@ class FDEPooler(Pooler):
         self.cfg = config
         self.R = config.R_reps
         self.B = 1 << config.ksim
-        self.mode = config.mode  # "query" or "doc" - default mode if not specified in request
+        self.B = 1 << config.ksim
 
         self.params = BatchedParams(d, config.ksim, config.d_proj, self.R, config.seed)
 
@@ -105,11 +105,11 @@ class FDEPooler(Pooler):
 
         # mixed precision: 파라미터를 half로 저장 (계산은 forward에서 X.dtype에 맞춰 upcast/downcast)
         if config.use_mixed_precision:
-            self.params.register_buffer("G", self.params.G.half())
+            self.params.G = self.params.G.half()
             if self.params.S is not None:
-                self.params.register_buffer("S", self.params.S.half())
+                self.params.S = self.params.S.half()
             if self.final_proj is not None:
-                self.final_proj.register_buffer("W", self.final_proj.W.half())
+                self.final_proj.W = self.final_proj.W.half()
 
     # --- vLLM Pooler API ---
 
@@ -150,8 +150,9 @@ class FDEPooler(Pooler):
 
     def _fill_empty_doc_buckets_hcube(
         self,
-        centroids: torch.Tensor,   # (N, R, B, d)
-        counts: torch.Tensor,      # (N, R, B)
+        centroids: torch.Tensor,  # (N, R, B, d)
+        counts: torch.Tensor,  # (N, R, B)
+        is_document: torch.Tensor,  # (N,)
     ) -> torch.Tensor:
         """
         For doc mode: fill empty buckets using Hamming neighbors in the SimHash hypercube.
@@ -164,25 +165,30 @@ class FDEPooler(Pooler):
         ksim = self.cfg.ksim
         device = centroids.device
 
-        masks = (1 << torch.arange(ksim, device=device, dtype=torch.long))  # (ksim,)
+        masks = 1 << torch.arange(ksim, device=device, dtype=torch.long)  # (ksim,)
 
         for n in range(N):
+            if not bool(is_document[n]):  # 쿼리 row는 skip
+                continue
+
             for r in range(R):
                 present = counts[n, r] > 0  # (B,)
                 if present.all():
                     continue
 
-                for b in range(B):
-                    if counts[n, r, b] > 0:
-                        continue
+                empty_mask = ~present
+                empty_idx = torch.nonzero(empty_mask, as_tuple=False).squeeze(-1)
+                if empty_idx.numel() == 0:
+                    continue
+
+                for b in empty_idx.tolist():
+                    b_val = int(b)
 
                     # ---- radius 1 ----
-                    b_val = int(b)
                     n1 = (b_val ^ masks).clamp_(0, B - 1)  # (ksim,)
-                    mask1 = present[n1]
-                    if mask1.any():
-                        chosen = int(n1[mask1][0])
-                        centroids[n, r, b] = centroids[n, r, chosen]
+                    cand = n1[present[n1]]
+                    if cand.numel() > 0:
+                        centroids[n, r, b] = centroids[n, r, int(cand[0])]
                         continue
 
                     # ---- radius 2 ----
@@ -215,9 +221,7 @@ class FDEPooler(Pooler):
 
         # prompt_lens 검증
         if pooling_metadata.prompt_lens is not None:
-            assert (
-                pooling_metadata.prompt_lens.sum().item() == hidden_states.size(0)
-            ), (
+            assert pooling_metadata.prompt_lens.sum().item() == hidden_states.size(0), (
                 f"Sum of prompt_lens ({pooling_metadata.prompt_lens.sum().item()}) "
                 f"does not match hidden_states length ({hidden_states.size(0)})"
             )
@@ -257,8 +261,8 @@ class FDEPooler(Pooler):
 
         # GlobalIndex = req * (R * B) + rep * B + bucket
         req_ids_expanded = req_ids.unsqueeze(1).expand(-1, self.R)  # (T, R)
-        rep_ids = torch.arange(self.R, device=X.device).unsqueeze(0).expand(
-            X.size(0), -1
+        rep_ids = (
+            torch.arange(self.R, device=X.device).unsqueeze(0).expand(X.size(0), -1)
         )  # (T, R)
 
         global_indices = (
@@ -290,21 +294,21 @@ class FDEPooler(Pooler):
         if is_document.any():
             # doc row는 per-bucket mean 사용
             counts_safe = counts.clamp_min(1.0)[..., None]  # (N, R, B, 1)
-            means = sums / counts_safe                       # (N, R, B, d)
+            means = sums / counts_safe  # (N, R, B, d)
 
-            is_doc_3d = is_document.view(num_reqs, 1, 1)     # (N,1,1)
-            mask_doc = is_doc_3d.expand_as(counts)           # (N,R,B)
+            is_doc_3d = is_document.view(num_reqs, 1, 1)  # (N,1,1)
+            mask_doc = is_doc_3d.expand_as(counts)  # (N,R,B)
 
             # doc bucket만 mean으로, 나머지는 sum 유지
             blocks_in = torch.where(mask_doc[..., None], means, sums)
 
             # --- doc 전용 empty bucket fill (옵션) ---
+            # --- doc 전용 empty bucket fill (옵션) ---
             if self.cfg.fill_empty_clusters:
-                # empty: counts == 0 인 버킷
-                mask_empty = (counts < 1e-9) & mask_doc  # (N, R, B)
-                if mask_empty.any():
-                    # Hypercube neighbor fill
-                    blocks_in = self._fill_empty_doc_buckets_hcube(blocks_in, counts)
+                # Hypercube neighbor fill (쿼리 row는 내부에서 skip됨)
+                blocks_in = self._fill_empty_doc_buckets_hcube(
+                    blocks_in, counts, is_document
+                )
 
         # Inner projection ψ
         S = self.params.S

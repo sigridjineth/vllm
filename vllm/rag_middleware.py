@@ -66,11 +66,13 @@ state = AppState()
 class QueryRequest(BaseModel):
     query: str
     k: int = 5
+    mode: str = "query"
 
 
 class IndexRequest(BaseModel):
     text: str
     metadata: dict[str, Any] = {}
+    mode: str = "doc"
 
 
 @app.on_event("startup")
@@ -96,16 +98,17 @@ async def startup_event():
     print("vLLM Engine and ANN Index initialized.")
 
 
-async def get_embedding(text: str) -> np.ndarray:
+async def get_embedding(text: str, mode: str = "query") -> np.ndarray:
     """Generate FDE embedding using vLLM."""
     if state.engine is None:
         raise RuntimeError("Engine not initialized")
 
     # Create a unique request ID
-    request_id = f"req_{hash(text)}"
+    request_id = f"req_{hash(text)}_{mode}"
 
     # Pooling params
-    pooling_params = PoolingParams()
+    is_doc = mode == "doc"
+    pooling_params = PoolingParams(is_document=is_doc)
 
     # Generate
     # vLLM's encode() returns an AsyncGenerator
@@ -139,7 +142,7 @@ async def query_endpoint(req: QueryRequest):
     """
     try:
         # 1. Embed
-        embedding = await get_embedding(req.query)
+        embedding = await get_embedding(req.query, mode=req.mode)
 
         # 2. Search
         # Check dim
@@ -162,7 +165,7 @@ async def index_endpoint(req: IndexRequest):
     2. Add to ANN index.
     """
     try:
-        embedding = await get_embedding(req.text)
+        embedding = await get_embedding(req.text, mode=req.mode)
 
         # Check dim
         if state.ann_index.dim != embedding.shape[0]:

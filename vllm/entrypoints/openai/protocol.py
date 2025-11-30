@@ -1399,6 +1399,10 @@ class EmbeddingCompletionRequest(OpenAIBaseModel):
             "This parameter will affect base64 and binary_response."
         ),
     )
+    is_document: bool = Field(
+        default=False,
+        description="Whether the input is a document (for FDE pooling: mean + fill). Default is False (query: sum).",
+    )
     # --8<-- [end:embedding-extra-params]
 
     def to_pooling_params(self):
@@ -1406,6 +1410,7 @@ class EmbeddingCompletionRequest(OpenAIBaseModel):
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             dimensions=self.dimensions,
             normalize=self.normalize,
+            is_document=self.is_document,
         )
 
 
@@ -1497,20 +1502,23 @@ class EmbeddingChatRequest(OpenAIBaseModel):
     # --8<-- [end:chat-embedding-extra-params]
 
     @model_validator(mode="before")
-    @classmethod
-    def check_generation_prompt(cls, data):
-        if data.get("continue_final_message") and data.get("add_generation_prompt"):
-            raise ValueError(
-                "Cannot set both `continue_final_message` and "
-                "`add_generation_prompt` to True."
-            )
-        return data
+    use_activation: bool | None = Field(
+        default=None,
+        description="Whether to use activation for classification outputs. "
+        "Default is True.",
+    )
+    is_document: bool = Field(
+        default=False,
+        description="Whether the input is a document (for FDE pooling: mean + fill). Default is False (query: sum).",
+    )
+    # --8<-- [end:chat-classification-extra-params]
 
     def to_pooling_params(self):
         return PoolingParams(
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             dimensions=self.dimensions,
             normalize=self.normalize,
+            is_document=self.is_document,
         )
 
 

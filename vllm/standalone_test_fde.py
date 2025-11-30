@@ -31,8 +31,10 @@ metadata_module = MagicMock()
 
 
 @dataclass
+@dataclass
 class MockPoolingMetadata:
     prompt_lens: torch.Tensor
+    pooling_params: list = None
 
 
 metadata_module.PoolingMetadata = MockPoolingMetadata
@@ -76,6 +78,12 @@ FDEPooler = fde_module.FDEPooler
 FDEConfig = fde_module.FDEConfig
 
 
+@dataclass
+class MockPoolingParams:
+    is_document: bool = False
+    normalize: bool = False
+
+
 def test_fde_pooler_shapes():
     d = 128
     config = FDEConfig(
@@ -91,7 +99,11 @@ def test_fde_pooler_shapes():
 
     # Simulate 2 requests
     prompt_lens = torch.tensor([10, 5], dtype=torch.int32)
-    pooling_metadata = MockPoolingMetadata(prompt_lens=prompt_lens)
+    # Default pooling params (is_document=False)
+    pooling_params = [MockPoolingParams(), MockPoolingParams()]
+    pooling_metadata = MockPoolingMetadata(
+        prompt_lens=prompt_lens, pooling_params=pooling_params
+    )
 
     hidden_states = torch.randn(15, d)
 
@@ -115,7 +127,10 @@ def test_fde_pooler_final_proj():
     pooler = FDEPooler(d=d, config=config)
 
     prompt_lens = torch.tensor([10], dtype=torch.int32)
-    pooling_metadata = MockPoolingMetadata(prompt_lens=prompt_lens)
+    pooling_params = [MockPoolingParams()]
+    pooling_metadata = MockPoolingMetadata(
+        prompt_lens=prompt_lens, pooling_params=pooling_params
+    )
 
     hidden_states = torch.randn(10, d)
     output = pooler(hidden_states, pooling_metadata)
@@ -124,6 +139,30 @@ def test_fde_pooler_final_proj():
     print("test_fde_pooler_final_proj passed")
 
 
+def test_fde_pooler_doc_mode():
+    d = 128
+    config = FDEConfig(
+        ksim=4, d_proj=8, R_reps=2, d_final=None, fill_empty_clusters=True
+    )
+    pooler = FDEPooler(d=d, config=config)
+
+    prompt_lens = torch.tensor([10], dtype=torch.int32)
+    # Enable document mode
+    pooling_params = [MockPoolingParams(is_document=True)]
+    pooling_metadata = MockPoolingMetadata(
+        prompt_lens=prompt_lens, pooling_params=pooling_params
+    )
+
+    hidden_states = torch.randn(10, d)
+    output = pooler(hidden_states, pooling_metadata)
+
+    expected_dim = 1 * 2 * 16 * 8
+    assert output.shape == (1, expected_dim)
+    assert not torch.isnan(output).any()
+    print("test_fde_pooler_doc_mode passed")
+
+
 if __name__ == "__main__":
     test_fde_pooler_shapes()
     test_fde_pooler_final_proj()
+    test_fde_pooler_doc_mode()
