@@ -23,7 +23,6 @@ class FDEConfig:
     fill_empty_clusters: bool = False
     seed: int = 42
     use_mixed_precision: bool = False
-    use_mixed_precision: bool = False
 
 
 class BatchedParams(nn.Module):
@@ -44,7 +43,8 @@ class BatchedParams(nn.Module):
         # S: (R, d_proj, d) or None
         self.use_proj = bool(d_proj and d_proj > 0 and d_proj != d)
         if self.use_proj:
-            g.manual_seed(seed)
+            # Do not reset seed, continue from current state for independence
+            # g.manual_seed(seed)
             s_init = (
                 torch.randint(
                     0, 2, (R, d_proj, d), dtype=torch.int8, generator=g, device="cpu"
@@ -90,7 +90,6 @@ class FDEPooler(Pooler):
         self.cfg = config
         self.R = config.R_reps
         self.B = 1 << config.ksim
-        self.B = 1 << config.ksim
 
         self.params = BatchedParams(d, config.ksim, config.d_proj, self.R, config.seed)
 
@@ -105,11 +104,11 @@ class FDEPooler(Pooler):
 
         # mixed precision: 파라미터를 half로 저장 (계산은 forward에서 X.dtype에 맞춰 upcast/downcast)
         if config.use_mixed_precision:
-            self.params.G = self.params.G.half()
+            self.params.register_buffer("G", self.params.G.half())
             if self.params.S is not None:
-                self.params.S = self.params.S.half()
+                self.params.register_buffer("S", self.params.S.half())
             if self.final_proj is not None:
-                self.final_proj.W = self.final_proj.W.half()
+                self.final_proj.register_buffer("W", self.final_proj.W.half())
 
     # --- vLLM Pooler API ---
 
@@ -309,6 +308,9 @@ class FDEPooler(Pooler):
                 blocks_in = self._fill_empty_doc_buckets_hcube(
                     blocks_in, counts, is_document
                 )
+
+        # --- Bucket-level L2 Normalization (MUVERA paper alignment) ---
+        blocks_in = F.normalize(blocks_in, p=2, dim=-1)
 
         # Inner projection ψ
         S = self.params.S
