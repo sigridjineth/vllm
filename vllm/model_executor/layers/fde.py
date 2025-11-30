@@ -38,7 +38,8 @@ class BatchedParams(nn.Module):
         # Initialize G only once
         g = torch.Generator()
         g.manual_seed(seed)
-        self.register_buffer("G", torch.randn(R, d, ksim, generator=g))
+        # Explicitly generate on CPU because generator is CPU
+        self.register_buffer("G", torch.randn(R, d, ksim, generator=g, device="cpu"))
 
         # S: (R, d_proj, d) or None
         self.use_proj = bool(d_proj and d_proj > 0 and d_proj != d)
@@ -46,7 +47,7 @@ class BatchedParams(nn.Module):
             # Initialize S with random +/- 1
             g.manual_seed(seed)  # Reset seed for S
             s_init = (
-                torch.randint(0, 2, (R, d_proj, d), dtype=torch.int8, generator=g) * 2
+                torch.randint(0, 2, (R, d_proj, d), dtype=torch.int8, generator=g, device="cpu") * 2
                 - 1
             ).to(torch.float32)
             self.register_buffer("S", s_init)
