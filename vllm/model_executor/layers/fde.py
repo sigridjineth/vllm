@@ -121,7 +121,7 @@ class FDEPooler(Pooler):
 
     # --- 내부 유틸 ---
 
-    def _normalize_rows(self, x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    def _normalize_rows(self, x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
         return x / (x.norm(dim=-1, keepdim=True) + eps)
 
     def _buckets_batched(self, X: torch.Tensor, G: torch.Tensor) -> torch.Tensor:
@@ -310,7 +310,8 @@ class FDEPooler(Pooler):
                 )
 
         # --- Bucket-level L2 Normalization (MUVERA paper alignment) ---
-        blocks_in = F.normalize(blocks_in, p=2, dim=-1)
+        # Use eps=1e-6 to avoid NaN in fp16 when buckets are empty (zero vectors)
+        blocks_in = F.normalize(blocks_in, p=2, dim=-1, eps=1e-6)
 
         # Inner projection ψ
         S = self.params.S
