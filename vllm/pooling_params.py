@@ -41,6 +41,7 @@ class PoolingParams(
     # --8<-- [start:embedding-pooling-params]
     dimensions: int | None = None
     normalize: bool | None = None
+    is_document: bool | None = None
     # --8<-- [end:embedding-pooling-params]
 
     ## for classification, scoring and rerank
@@ -63,12 +64,12 @@ class PoolingParams(
 
     @property
     def all_parameters(self) -> list[str]:
-        return ["dimensions", "normalize", "use_activation"]
+        return ["dimensions", "normalize", "use_activation", "is_document"]
 
     @property
     def valid_parameters(self):
         return {
-            "embed": ["dimensions", "normalize"],
+            "embed": ["dimensions", "normalize", "is_document"],
             "classify": ["use_activation"],
             "score": ["use_activation"],
             "token_embed": ["dimensions", "normalize"],
@@ -164,6 +165,8 @@ class PoolingParams(
         if self.task in ["embed", "token_embed"]:
             if self.normalize is None:
                 self.normalize = True
+            if self.is_document is None:
+                self.is_document = False
 
             if self.dimensions is not None and model_config is not None:
                 if not model_config.is_matryoshka:
@@ -214,6 +217,7 @@ class PoolingParams(
             f"PoolingParams("
             f"task={self.task}, "
             f"normalize={self.normalize}, "
+            f"is_document={self.is_document}, "
             f"dimensions={self.dimensions}, "
             f"use_activation={self.use_activation}, "
             f"step_tag_id={self.step_tag_id}, "

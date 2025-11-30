@@ -19,36 +19,37 @@ class FDEConfig:
     d_proj: int = 32
     R_reps: int = 10
     d_final: int | None = None
-    fill_empty_clusters: bool = (
-        False  # Default to False for queries as per recommendation
-    )
+    # 쿼리에는 기본적으로 쓰지 않는 것을 권장 (doc에만 True)
+    fill_empty_clusters: bool = False
     seed: int = 42
     use_mixed_precision: bool = False
+    mode: str = "query"  # "query" or "doc"
 
 
 class BatchedParams(nn.Module):
     """
-    Holds the learnable (or fixed) parameters for FDE:
+    Holds the (fixed) parameters for FDE:
     G: SimHash directions
     S: Inner projection matrix
     """
 
     def __init__(self, d: int, ksim: int, d_proj: int | None, R: int, seed: int):
         super().__init__()
-        # G: (R, d, ksim)
-        # Initialize G only once
         g = torch.Generator()
         g.manual_seed(seed)
-        # Explicitly generate on CPU because generator is CPU
+
+        # G: (R, d, ksim)
         self.register_buffer("G", torch.randn(R, d, ksim, generator=g, device="cpu"))
 
         # S: (R, d_proj, d) or None
         self.use_proj = bool(d_proj and d_proj > 0 and d_proj != d)
         if self.use_proj:
-            # Initialize S with random +/- 1
-            g.manual_seed(seed)  # Reset seed for S
+            g.manual_seed(seed)
             s_init = (
-                torch.randint(0, 2, (R, d_proj, d), dtype=torch.int8, generator=g, device="cpu") * 2
+                torch.randint(
+                    0, 2, (R, d_proj, d), dtype=torch.int8, generator=g, device="cpu"
+                )
+                * 2
                 - 1
             ).to(torch.float32)
             self.register_buffer("S", s_init)
@@ -76,7 +77,11 @@ class FinalProjectionStreamer(nn.Module):
 
 class FDEPooler(Pooler):
     """
-    FDE Pooler implementation compatible with vLLM.
+    MUVERA-style FDE Pooler (쿼리/문서 둘 다 지원).
+    - 쿼리(request with is_document=False):
+        per-bucket sum (Fq)
+    - 문서(request with is_document=True):
+        per-bucket mean (Fdoc) + 선택적 empty bucket fill
     """
 
     def __init__(self, d: int, config: FDEConfig):
@@ -85,6 +90,7 @@ class FDEPooler(Pooler):
         self.cfg = config
         self.R = config.R_reps
         self.B = 1 << config.ksim
+        self.mode = config.mode  # "query" or "doc" - default mode if not specified in request
 
         self.params = BatchedParams(d, config.ksim, config.d_proj, self.R, config.seed)
 
@@ -97,19 +103,24 @@ class FDEPooler(Pooler):
         else:
             self.final_proj = None
 
-        # Handle mixed precision if requested
+        # mixed precision: 파라미터를 half로 저장 (계산은 forward에서 X.dtype에 맞춰 upcast/downcast)
         if config.use_mixed_precision:
-            self.params.G = self.params.G.half()
+            self.params.register_buffer("G", self.params.G.half())
             if self.params.S is not None:
-                self.params.S = self.params.S.half()
+                self.params.register_buffer("S", self.params.S.half())
             if self.final_proj is not None:
-                self.final_proj.W = self.final_proj.W.half()
+                self.final_proj.register_buffer("W", self.final_proj.W.half())
+
+    # --- vLLM Pooler API ---
 
     def get_supported_tasks(self) -> set[PoolingTask]:
+        # 문자열 "embed" 대신 enum 사용
         return {"embed"}
 
     def get_pooling_updates(self, task: PoolingTask) -> PoolingParamsUpdate:
         return PoolingParamsUpdate()
+
+    # --- 내부 유틸 ---
 
     def _normalize_rows(self, x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
         return x / (x.norm(dim=-1, keepdim=True) + eps)
@@ -126,8 +137,69 @@ class FDEPooler(Pooler):
         logits = torch.einsum("td,Rdk->tRk", X, G)
         bits = (logits > 0).to(torch.int64)
         powers = 1 << torch.arange(G.size(-1), device=X.device, dtype=torch.int64)
-        # (T, R, k) * (k) -> (T, R)
+        # (T, R, k) * (k,) -> (T, R)
         return (bits * powers).sum(dim=-1)
+
+    def _project_block_batched(
+        self, blocks: torch.Tensor, S: torch.Tensor | None
+    ) -> torch.Tensor:
+        if S is None:
+            return blocks
+        # blocks: (N, R, B, d), S: (R, d_proj, d) -> (N, R, B, d_proj)
+        return torch.einsum("NRBd,Rpd->NRBp", blocks, S)
+
+    def _fill_empty_doc_buckets_hcube(
+        self,
+        centroids: torch.Tensor,   # (N, R, B, d)
+        counts: torch.Tensor,      # (N, R, B)
+    ) -> torch.Tensor:
+        """
+        For doc mode: fill empty buckets using Hamming neighbors in the SimHash hypercube.
+        Strategy:
+          - radius 1 neighbors first
+          - if none present, radius 2
+          - else leave as is (rare)
+        """
+        N, R, B, d = centroids.shape
+        ksim = self.cfg.ksim
+        device = centroids.device
+
+        masks = (1 << torch.arange(ksim, device=device, dtype=torch.long))  # (ksim,)
+
+        for n in range(N):
+            for r in range(R):
+                present = counts[n, r] > 0  # (B,)
+                if present.all():
+                    continue
+
+                for b in range(B):
+                    if counts[n, r, b] > 0:
+                        continue
+
+                    # ---- radius 1 ----
+                    b_val = int(b)
+                    n1 = (b_val ^ masks).clamp_(0, B - 1)  # (ksim,)
+                    mask1 = present[n1]
+                    if mask1.any():
+                        chosen = int(n1[mask1][0])
+                        centroids[n, r, b] = centroids[n, r, chosen]
+                        continue
+
+                    # ---- radius 2 ----
+                    found = False
+                    for i in range(ksim):
+                        if found:
+                            break
+                        mi = int(masks[i])
+                        for j in range(i + 1, ksim):
+                            nb = b_val ^ mi ^ int(masks[j])
+                            if 0 <= nb < B and present[nb]:
+                                centroids[n, r, b] = centroids[n, r, nb]
+                                found = True
+                                break
+        return centroids
+
+    # --- main forward ---
 
     def forward(
         self,
@@ -135,164 +207,129 @@ class FDEPooler(Pooler):
         pooling_metadata: PoolingMetadata,
     ) -> torch.Tensor:
         """
-        hidden_states: (TotalTokens, d) - flattened
-        pooling_metadata: contains seq_lens and other info
+        hidden_states: (TotalTokens, d) - flattened across all requests
+        pooling_metadata: contains prompt_lens, pooling_params (per request)
         """
         if isinstance(hidden_states, list):
             hidden_states = torch.cat(hidden_states, dim=0)
 
-        # Verify prompt_lens matches hidden_states length
+        # prompt_lens 검증
         if pooling_metadata.prompt_lens is not None:
-            assert pooling_metadata.prompt_lens.sum().item() == hidden_states.size(0), (
-                f"Sum of prompt_lens ({pooling_metadata.prompt_lens.sum().item()}) does not match hidden_states length ({hidden_states.size(0)})"
+            assert (
+                pooling_metadata.prompt_lens.sum().item() == hidden_states.size(0)
+            ), (
+                f"Sum of prompt_lens ({pooling_metadata.prompt_lens.sum().item()}) "
+                f"does not match hidden_states length ({hidden_states.size(0)})"
             )
 
         X = self._normalize_rows(hidden_states)
 
-        # Ensure params are on the correct device and dtype
-        # This handles cases where vLLM initializes on CPU but runs on GPU,
-        # or where model is loaded in float16 but params are float32.
+        # params를 X와 같은 device/dtype으로 맞춰주기
         if self.params.G.device != X.device or self.params.G.dtype != X.dtype:
             self.params.to(device=X.device, dtype=X.dtype)
             if self.final_proj is not None:
                 self.final_proj.to(device=X.device, dtype=X.dtype)
 
-        # Get bucket IDs for all tokens
-        # G: (R, d, ksim)
-        G = self.params.G
-        # bids: (TotalTokens, R)
-        bids = self._buckets_batched(X, G)
+        # SimHash bucket IDs
+        G = self.params.G  # (R, d, ksim)
+        bids = self._buckets_batched(X, G)  # (TotalTokens, R)
 
-        # We need to aggregate per request.
-        # Construct global bucket indices:
-        # GlobalIndex = RequestID * (R * B) + RepetitionID * B + BucketID
-
-        # 1. Generate Request IDs for each token
-        # pooling_metadata.prompt_lens is a tensor of shape (NumRequests,)
+        # per-request aggregation 준비
         prompt_lens = pooling_metadata.prompt_lens.to(X.device)
         num_reqs = len(prompt_lens)
 
-        # Create request_ids tensor: [0, 0, ..., 1, 1, ..., N-1, ...]
-        # We can use repeat_interleave
+        # request id per token: [0..0, 1..1, ..., N-1..N-1]
         req_ids = torch.repeat_interleave(
             torch.arange(num_reqs, device=X.device), prompt_lens
         )  # (TotalTokens,)
 
-        # 2. Compute Global Indices
-        # bids: (TotalTokens, R)
-        # req_ids: (TotalTokens,) -> expand to (TotalTokens, R)
-        req_ids_expanded = req_ids.unsqueeze(1).expand(-1, self.R)
+        # 요청별 doc/query 플래그 읽기
+        pooling_params = pooling_metadata.pooling_params or []
+        if pooling_params:
+            is_document = torch.tensor(
+                [getattr(p, "is_document", False) for p in pooling_params],
+                device=X.device,
+                dtype=torch.bool,
+            )  # (N,)
+        else:
+            # pooling_params 없으면 전부 query로 취급
+            is_document = torch.zeros(num_reqs, device=X.device, dtype=torch.bool)
 
-        # Repetition IDs: 0..R-1
-        rep_ids = (
-            torch.arange(self.R, device=X.device).unsqueeze(0).expand(X.size(0), -1)
-        )
+        # GlobalIndex = req * (R * B) + rep * B + bucket
+        req_ids_expanded = req_ids.unsqueeze(1).expand(-1, self.R)  # (T, R)
+        rep_ids = torch.arange(self.R, device=X.device).unsqueeze(0).expand(
+            X.size(0), -1
+        )  # (T, R)
 
-        # Global Index = req * (R*B) + rep * B + bid
-        global_indices = req_ids_expanded * (self.R * self.B) + rep_ids * self.B + bids
-        # global_indices: (TotalTokens, R)
+        global_indices = (
+            req_ids_expanded * (self.R * self.B) + rep_ids * self.B + bids
+        )  # (T, R)
+        flat_indices = global_indices.reshape(-1)  # (T * R,)
 
-        # Flatten global_indices and X for scatter add
-        flat_indices = global_indices.reshape(-1)  # (TotalTokens * R)
-
-        # X needs to be repeated R times to match indices?
-        # No, X is (TotalTokens, d). We want to add X[t] to R different buckets.
-        # So we repeat X: (TotalTokens, R, d) -> flatten -> (TotalTokens * R, d)
+        # X를 반복해서 (T, R, d) -> (T*R, d)
         X_expanded = X.unsqueeze(1).expand(-1, self.R, -1).reshape(-1, self.d)
 
-        # Target tensor: (NumRequests * R * B, d)
         out_dim = num_reqs * self.R * self.B
+
+        # sums: (NumRequests * R * B, d)
         sums = torch.zeros((out_dim, self.d), device=X.device, dtype=X.dtype)
-
-        # Scatter add
         sums.index_add_(0, flat_indices, X_expanded)
+        sums = sums.view(num_reqs, self.R, self.B, self.d)  # (N, R, B, d)
 
-        # Reshape to (NumRequests, R, B, d)
-        sums = sums.view(num_reqs, self.R, self.B, self.d)
+        # --- doc/query 공통: counts 계산 (doc mean에 사용) ---
+        ones = torch.ones_like(flat_indices, dtype=X.dtype, device=X.device)
+        counts_flat = torch.zeros(out_dim, dtype=X.dtype, device=X.device)
+        counts_flat.index_add_(0, flat_indices, ones)
+        counts = counts_flat.view(num_reqs, self.R, self.B)  # (N, R, B)
 
-        # Fill empty clusters if enabled
-        if self.cfg.fill_empty_clusters:
-            # Check for empty buckets (norm == 0)
-            # sums: (N, R, B, d)
-            norms = sums.norm(dim=-1)  # (N, R, B)
-            mask = norms < 1e-9  # (N, R, B)
+        # --- doc/query 모드 분기: sum vs mean ---
 
-            if mask.any():
-                # Fallback: Fill empty buckets with the mean of the request's tokens
-                # Compute mean per request
-                # We can't easily get mean from sums because sums are partitioned.
-                # But we can compute it from X using scatter_add on req_ids.
+        # 기본은 query 모드: sum
+        blocks_in = sums
 
-                # req_mean_sums: (NumRequests, d)
-                req_mean_sums = torch.zeros(
-                    (num_reqs, self.d), device=X.device, dtype=X.dtype
-                )
-                req_mean_sums.index_add_(0, req_ids, X)
+        if is_document.any():
+            # doc row는 per-bucket mean 사용
+            counts_safe = counts.clamp_min(1.0)[..., None]  # (N, R, B, 1)
+            means = sums / counts_safe                       # (N, R, B, d)
 
-                # count per request: (NumRequests, 1)
-                req_counts = prompt_lens.unsqueeze(1).to(X.dtype)
-                req_means = req_mean_sums / req_counts.clamp(
-                    min=1.0
-                )  # (NumRequests, d)
+            is_doc_3d = is_document.view(num_reqs, 1, 1)     # (N,1,1)
+            mask_doc = is_doc_3d.expand_as(counts)           # (N,R,B)
 
-                # Expand means to (N, R, B, d)
-                # We only need to fill where mask is True
-                # mask: (N, R, B)
-                # req_means: (N, d) -> (N, 1, 1, d) -> expand
-                req_means_expanded = (
-                    req_means.unsqueeze(1).unsqueeze(1).expand(-1, self.R, self.B, -1)
-                )
+            # doc bucket만 mean으로, 나머지는 sum 유지
+            blocks_in = torch.where(mask_doc[..., None], means, sums)
 
-                # Apply fill
-                # We use where: if mask is True (empty), use mean, else use sum
-                sums = torch.where(mask.unsqueeze(-1), req_means_expanded, sums)
+            # --- doc 전용 empty bucket fill (옵션) ---
+            if self.cfg.fill_empty_clusters:
+                # empty: counts == 0 인 버킷
+                mask_empty = (counts < 1e-9) & mask_doc  # (N, R, B)
+                if mask_empty.any():
+                    # Hypercube neighbor fill
+                    blocks_in = self._fill_empty_doc_buckets_hcube(blocks_in, counts)
 
-        # Project blocks
+        # Inner projection ψ
         S = self.params.S
-        # sums: (N, R, B, d)
-        # S: (R, dp, d)
-        # We want (N, R, B, dp)
-        # einsum: NRBd, Rpd -> NRBp
-        blocks = self._project_block_batched(sums, S)
+        blocks = self._project_block_batched(blocks_in, S)  # (N, R, B, d_block)
 
-        # Flatten to (N, R * B * d_block)
+        # Flatten to (N, R*B*d_block)
         flat = blocks.reshape(num_reqs, -1)
 
-        # Final projection
+        # Final projection ψ'
         if self.final_proj:
             output = self.final_proj(flat)
         else:
             output = flat
 
-        # Apply normalization if requested in PoolingParams
-        # We assume all requests in the batch have the same normalization setting for now,
-        # or we handle it per request.
-        # pooling_metadata.pooling_params is a list of PoolingParams, one per request.
-        pooling_params = pooling_metadata.pooling_params
+        # --- optional L2 normalize per request ---
         if pooling_params and any(p.normalize for p in pooling_params):
-            # If any request wants normalization, we normalize all for efficiency if they all want it.
-            # If mixed, we need to handle carefully.
-            # For simplicity and common use case (all requests same config), we check the first one
-            # or apply to all if generally enabled.
-            # Let's do per-row normalization if the corresponding param requests it.
-            
-            # Create a boolean mask for normalization
             do_normalize = torch.tensor(
-                [p.normalize for p in pooling_params], device=output.device, dtype=torch.bool
-            )
-            
+                [p.normalize for p in pooling_params],
+                device=output.device,
+                dtype=torch.bool,
+            )  # (N,)
             if do_normalize.all():
                 output = F.normalize(output, p=2, dim=-1)
             elif do_normalize.any():
-                # Normalize only selected rows
                 normalized = F.normalize(output, p=2, dim=-1)
                 output = torch.where(do_normalize.unsqueeze(1), normalized, output)
 
         return output
-
-    def _project_block_batched(
-        self, blocks: torch.Tensor, S: torch.Tensor | None
-    ) -> torch.Tensor:
-        if S is None:
-            return blocks
-        return torch.einsum("NRBd,Rpd->NRBp", blocks, S)
