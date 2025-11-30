@@ -1501,7 +1501,6 @@ class EmbeddingChatRequest(OpenAIBaseModel):
     )
     # --8<-- [end:chat-embedding-extra-params]
 
-    @model_validator(mode="before")
     use_activation: bool | None = Field(
         default=None,
         description="Whether to use activation for classification outputs. "
