@@ -148,12 +148,13 @@ class FDEPooler(Pooler):
 
         X = self._normalize_rows(hidden_states)
 
-        # Ensure params are on the correct device
-        # This handles cases where vLLM initializes on CPU but runs on GPU
-        if self.params.G.device != X.device:
-            self.params.G = self.params.G.to(X.device)
-            if self.params.S is not None:
-                self.params.S = self.params.S.to(X.device)
+        # Ensure params are on the correct device and dtype
+        # This handles cases where vLLM initializes on CPU but runs on GPU,
+        # or where model is loaded in float16 but params are float32.
+        if self.params.G.device != X.device or self.params.G.dtype != X.dtype:
+            self.params.to(device=X.device, dtype=X.dtype)
+            if self.final_proj is not None:
+                self.final_proj.to(device=X.device, dtype=X.dtype)
 
         # Get bucket IDs for all tokens
         # G: (R, d, ksim)
