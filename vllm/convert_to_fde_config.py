@@ -10,6 +10,7 @@ def main():
     parser.add_argument("--ksim", type=int, default=6, help="FDE ksim parameter")
     parser.add_argument("--d_proj", type=int, default=32, help="FDE d_proj parameter")
     parser.add_argument("--R_reps", type=int, default=10, help="FDE R_reps parameter")
+    parser.add_argument("--d_final", type=int, default=None, help="FDE d_final parameter (output dimension). If None, no final projection is applied (recommended unless dimensionality reduction is needed).")
     parser.add_argument("--fill_empty_clusters", action="store_true", help="Enable empty cluster filling (default: False)")
     
     args = parser.parse_args()
@@ -43,7 +44,7 @@ def main():
         "ksim": args.ksim,
         "d_proj": args.d_proj,
         "R_reps": args.R_reps,
-        "d_final": (1 << args.ksim) * args.d_proj * args.R_reps, # Auto-calc d_final
+        "d_final": args.d_final, # Use provided d_final (None by default)
         "fill_empty_clusters": args.fill_empty_clusters,
         "seed": 42
     }
