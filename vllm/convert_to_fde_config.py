@@ -52,6 +52,46 @@ def main():
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
         
+    print("Generating FDE parameters...")
+    try:
+        import torch
+        # We need to import FDEPooler and FDEConfig to generate params correctly
+        # Assuming vllm is installed in editable mode or available in path
+        from vllm.model_executor.layers.fde import FDEPooler, FDEConfig
+        
+        fde_config = FDEConfig(
+            ksim=args.ksim,
+            d_proj=args.d_proj,
+            R_reps=args.R_reps,
+            d_final=config["fde_config"]["d_final"],
+            fill_empty_clusters=args.fill_empty_clusters,
+            seed=42,
+            use_mixed_precision=False # Save as float32 for compatibility
+        )
+        
+        # Initialize pooler to generate params
+        # We need hidden_size from config
+        hidden_size = config["hidden_size"]
+        pooler = FDEPooler(d=hidden_size, config=fde_config)
+        
+        # Extract params
+        state_dict = {}
+        state_dict["G"] = pooler.params.G
+        if pooler.params.S is not None:
+            state_dict["S"] = pooler.params.S
+        if pooler.final_proj is not None:
+            state_dict["W"] = pooler.final_proj.W
+            
+        # Save to fde_params.pt
+        params_path = os.path.join(args.output, "fde_params.pt")
+        torch.save(state_dict, params_path)
+        print(f"FDE parameters saved to {params_path}")
+        
+    except ImportError:
+        print("Warning: Could not import vllm to generate FDE params. You will see a warning when loading the model.")
+    except Exception as e:
+        print(f"Warning: Failed to generate FDE params: {e}")
+
     print(f"Success! FDE-enabled model saved to {args.output}")
     print(f"Run vLLM with: vllm serve {args.output} --trust-remote-code")
 
