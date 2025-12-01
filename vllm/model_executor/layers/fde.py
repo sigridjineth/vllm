@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from vllm.model_executor.layers.pooler import Pooler, PoolingParamsUpdate
 from vllm.tasks import PoolingTask
+from vllm.v1.outputs import PoolerOutput
 from vllm.v1.pool.metadata import PoolingMetadata
 
 
@@ -212,7 +213,7 @@ class FDEPooler(Pooler):
         self,
         hidden_states: torch.Tensor | list[torch.Tensor],
         pooling_metadata: PoolingMetadata,
-    ) -> torch.Tensor:
+    ) -> PoolerOutput:
         """
         hidden_states: (TotalTokens, d) - flattened across all requests
         pooling_metadata: contains prompt_lens, pooling_params (per request)
@@ -221,6 +222,7 @@ class FDEPooler(Pooler):
             hidden_states = torch.cat(hidden_states, dim=0)
 
         # prompt_lens 검증
+        assert pooling_metadata.prompt_lens is not None, "prompt_lens must not be None"
         if pooling_metadata.prompt_lens is not None:
             assert pooling_metadata.prompt_lens.sum().item() == hidden_states.size(0), (
                 f"Sum of prompt_lens ({pooling_metadata.prompt_lens.sum().item()}) "
@@ -258,49 +260,55 @@ class FDEPooler(Pooler):
 
         # Output dimensions
         out_dim = num_reqs * self.R * self.B
-        
+
         # Initialize global accumulators
         sums = torch.zeros((out_dim, self.d), device=X.device, dtype=X.dtype)
         counts_flat = torch.zeros(out_dim, dtype=X.dtype, device=X.device)
-        
+
         # Mini-batch configuration
         # 65536 tokens * 10 reps * 128 dim * 2 bytes (fp16) ~= 160MB per chunk expansion
         chunk_size = self.chunk_size
         num_tokens = X.size(0)
-        
+
         G = self.params.G  # (R, d, ksim)
-        
+
         # Pre-compute rep_ids for expansion (reused in loop if size matches, but cheap to make)
         # We need rep_ids of shape (chunk_size, R)
-        
+
         for start_idx in range(0, num_tokens, chunk_size):
             end_idx = min(start_idx + chunk_size, num_tokens)
-            
+
             # Slice inputs
-            X_chunk = X[start_idx:end_idx]          # (chunk, d)
+            X_chunk = X[start_idx:end_idx]  # (chunk, d)
             req_ids_chunk = req_ids[start_idx:end_idx]  # (chunk,)
             chunk_len = end_idx - start_idx
-            
+
             # 1. Compute Bucket IDs for chunk
             bids_chunk = self._buckets_batched(X_chunk, G)  # (chunk, R)
-            
+
             # 2. Compute Global Indices for chunk
             # GlobalIndex = req * (R * B) + rep * B + bucket
-            req_ids_expanded = req_ids_chunk.unsqueeze(1).expand(-1, self.R)  # (chunk, R)
-            rep_ids = torch.arange(self.R, device=X.device).unsqueeze(0).expand(chunk_len, -1) # (chunk, R)
-            
+            req_ids_expanded = req_ids_chunk.unsqueeze(1).expand(
+                -1, self.R
+            )  # (chunk, R)
+            rep_ids = (
+                torch.arange(self.R, device=X.device).unsqueeze(0).expand(chunk_len, -1)
+            )  # (chunk, R)
+
             global_indices = (
                 req_ids_expanded * (self.R * self.B) + rep_ids * self.B + bids_chunk
-            ) # (chunk, R)
+            )  # (chunk, R)
             flat_indices = global_indices.reshape(-1)  # (chunk * R,)
-            
+
             # 3. Expand X for aggregation
             # (chunk, d) -> (chunk, R, d) -> (chunk*R, d)
-            X_chunk_expanded = X_chunk.unsqueeze(1).expand(-1, self.R, -1).reshape(-1, self.d)
-            
+            X_chunk_expanded = (
+                X_chunk.unsqueeze(1).expand(-1, self.R, -1).reshape(-1, self.d)
+            )
+
             # 4. Accumulate
             sums.index_add_(0, flat_indices, X_chunk_expanded)
-            
+
             # Accumulate counts
             ones = torch.ones_like(flat_indices, dtype=X.dtype, device=X.device)
             counts_flat.index_add_(0, flat_indices, ones)
@@ -350,9 +358,9 @@ class FDEPooler(Pooler):
             output = flat
 
         # --- optional L2 normalize per request ---
-        if pooling_params and any(p.normalize for p in pooling_params):
+        if pooling_params and any(bool(p.normalize) for p in pooling_params):
             do_normalize = torch.tensor(
-                [p.normalize for p in pooling_params],
+                [bool(p.normalize) for p in pooling_params],
                 device=output.device,
                 dtype=torch.bool,
             )  # (N,)

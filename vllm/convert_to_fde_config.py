@@ -37,7 +37,7 @@ def main():
         
     # Modify Architecture
     print("Modifying config.json...")
-    config["architectures"] = ["BgeM3FDEModel"]
+    config["architectures"] = ["BgeM3FDE"]
     
     # Add FDE Config
     config["fde_config"] = {
