@@ -36,6 +36,10 @@ RUN uv pip install --upgrade pip
 RUN uv pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu118
 # Install build dependencies required for --no-build-isolation
 RUN uv pip install setuptools setuptools-scm wheel jinja2 packaging cmake ninja
+
+# Limit CUDA architectures to Ampere (8.0, 8.6) to avoid SM89 FP8 errors with CUDA 11.8
+ENV TORCH_CUDA_ARCH_LIST="8.0 8.6"
+
 RUN uv pip install -e . --no-build-isolation
 
 # Copy the conversion script to workspace root
