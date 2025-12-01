@@ -34,8 +34,8 @@ WORKDIR /workspace/vllm
 RUN uv pip install --upgrade pip
 # Install PyTorch with CUDA 11.8 support explicitly
 RUN uv pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu118
-# Install setuptools which is required for --no-build-isolation
-RUN uv pip install setuptools
+# Install build dependencies required for --no-build-isolation
+RUN uv pip install setuptools setuptools-scm wheel jinja2 packaging cmake ninja
 RUN uv pip install -e . --no-build-isolation
 
 # Copy the conversion script to workspace root
