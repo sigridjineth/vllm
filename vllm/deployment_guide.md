@@ -10,7 +10,7 @@ This guide explains how to build and deploy the vLLM image with MUVERA FDE suppo
 ## 2. Build the Docker Image
 
 The `Dockerfile.fde` is configured to:
-1.  Use `nvidia/cuda:12.4.1-devel-ubuntu22.04` as the base image.
+1.  Use `nvidia/cuda:11.8.0-devel-ubuntu22.04` as the base image.
 2.  Use `uv` to install Python 3.10 and manage the virtual environment.
 3.  Install the modified vLLM source code from the local directory.
 4.  **Automatically download and convert** the BGE-M3 model to an FDE-enabled model during the build process.
