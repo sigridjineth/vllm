@@ -1,0 +1,67 @@
+
+# Use NVIDIA CUDA base image for build capability
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+# Set working directory
+WORKDIR /workspace
+
+# Install system dependencies
+# git, curl for uv, etc.
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+ADD https://astral.sh/uv/install.sh /uv-installer.sh
+RUN sh /uv-installer.sh && rm /uv-installer.sh
+ENV PATH="/root/.cargo/bin/:$PATH"
+
+# Install Python and create venv using uv
+# vLLM typically supports 3.9-3.12. Using 3.10 as a safe default for compatibility.
+RUN uv python install 3.10
+RUN uv venv /workspace/.venv
+
+# Activate venv
+ENV VIRTUAL_ENV=/workspace/.venv
+ENV PATH="/workspace/.venv/bin:$PATH"
+
+# Copy the local vLLM source code into the container
+COPY . /workspace/vllm
+
+# Install build dependencies and vLLM
+# This might take a while as it compiles vLLM extensions
+WORKDIR /workspace/vllm
+RUN uv pip install --upgrade pip
+RUN uv pip install -e .
+
+# Copy the conversion script to workspace root
+WORKDIR /workspace
+COPY convert_to_fde_config.py /workspace/
+
+# Build arguments for FDE model conversion
+ARG MODEL_ID=BAAI/bge-m3
+ARG KSIM=6
+ARG D_PROJ=32
+ARG R_REPS=10
+ARG FILL_EMPTY=true
+
+# Run the conversion script
+# We need to ensure torch is available (installed via vllm dependency)
+RUN python3 convert_to_fde_config.py \
+    --model ${MODEL_ID} \
+    --output /workspace/bge-m3-fde \
+    --ksim ${KSIM} \
+    --d_proj ${D_PROJ} \
+    --R_reps ${R_REPS} \
+    $( [ "${FILL_EMPTY}" = "true" ] && echo "--fill_empty_clusters" )
+
+# Set environment variables
+ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+
+# Expose the port
+EXPOSE 8000
+
+# Set the default command
+CMD ["vllm", "serve", "/workspace/bge-m3-fde", "--trust-remote-code", "--dtype", "float16", "--enforce-eager"]
