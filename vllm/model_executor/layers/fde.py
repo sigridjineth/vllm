@@ -110,6 +110,8 @@ class FDEPooler(Pooler):
             if self.final_proj is not None:
                 self.final_proj.register_buffer("W", self.final_proj.W.half())
 
+        self.chunk_size = 65536
+
     # --- vLLM Pooler API ---
 
     def get_supported_tasks(self) -> set[PoolingTask]:
@@ -263,7 +265,7 @@ class FDEPooler(Pooler):
         
         # Mini-batch configuration
         # 65536 tokens * 10 reps * 128 dim * 2 bytes (fp16) ~= 160MB per chunk expansion
-        CHUNK_SIZE = 65536 
+        chunk_size = self.chunk_size
         num_tokens = X.size(0)
         
         G = self.params.G  # (R, d, ksim)
@@ -271,8 +273,8 @@ class FDEPooler(Pooler):
         # Pre-compute rep_ids for expansion (reused in loop if size matches, but cheap to make)
         # We need rep_ids of shape (chunk_size, R)
         
-        for start_idx in range(0, num_tokens, CHUNK_SIZE):
-            end_idx = min(start_idx + CHUNK_SIZE, num_tokens)
+        for start_idx in range(0, num_tokens, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_tokens)
             
             # Slice inputs
             X_chunk = X[start_idx:end_idx]          # (chunk, d)
