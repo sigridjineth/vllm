@@ -38,7 +38,7 @@ RUN uv pip install -e .
 
 # Copy the conversion script to workspace root
 WORKDIR /workspace
-COPY convert_to_fde_config.py /workspace/
+COPY vllm/convert_to_fde_config.py /workspace/
 
 # Build arguments for FDE model conversion
 ARG MODEL_ID=BAAI/bge-m3
