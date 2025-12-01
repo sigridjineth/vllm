@@ -233,10 +233,6 @@ class FDEPooler(Pooler):
             if self.final_proj is not None:
                 self.final_proj.to(device=X.device, dtype=X.dtype)
 
-        # SimHash bucket IDs
-        G = self.params.G  # (R, d, ksim)
-        bids = self._buckets_batched(X, G)  # (TotalTokens, R)
-
         # per-request aggregation 준비
         prompt_lens = pooling_metadata.prompt_lens.to(X.device)
         num_reqs = len(prompt_lens)
@@ -258,31 +254,57 @@ class FDEPooler(Pooler):
             # pooling_params 없으면 전부 query로 취급
             is_document = torch.zeros(num_reqs, device=X.device, dtype=torch.bool)
 
-        # GlobalIndex = req * (R * B) + rep * B + bucket
-        req_ids_expanded = req_ids.unsqueeze(1).expand(-1, self.R)  # (T, R)
-        rep_ids = (
-            torch.arange(self.R, device=X.device).unsqueeze(0).expand(X.size(0), -1)
-        )  # (T, R)
-
-        global_indices = (
-            req_ids_expanded * (self.R * self.B) + rep_ids * self.B + bids
-        )  # (T, R)
-        flat_indices = global_indices.reshape(-1)  # (T * R,)
-
-        # X를 반복해서 (T, R, d) -> (T*R, d)
-        X_expanded = X.unsqueeze(1).expand(-1, self.R, -1).reshape(-1, self.d)
-
+        # Output dimensions
         out_dim = num_reqs * self.R * self.B
-
-        # sums: (NumRequests * R * B, d)
+        
+        # Initialize global accumulators
         sums = torch.zeros((out_dim, self.d), device=X.device, dtype=X.dtype)
-        sums.index_add_(0, flat_indices, X_expanded)
-        sums = sums.view(num_reqs, self.R, self.B, self.d)  # (N, R, B, d)
-
-        # --- doc/query 공통: counts 계산 (doc mean에 사용) ---
-        ones = torch.ones_like(flat_indices, dtype=X.dtype, device=X.device)
         counts_flat = torch.zeros(out_dim, dtype=X.dtype, device=X.device)
-        counts_flat.index_add_(0, flat_indices, ones)
+        
+        # Mini-batch configuration
+        # 65536 tokens * 10 reps * 128 dim * 2 bytes (fp16) ~= 160MB per chunk expansion
+        CHUNK_SIZE = 65536 
+        num_tokens = X.size(0)
+        
+        G = self.params.G  # (R, d, ksim)
+        
+        # Pre-compute rep_ids for expansion (reused in loop if size matches, but cheap to make)
+        # We need rep_ids of shape (chunk_size, R)
+        
+        for start_idx in range(0, num_tokens, CHUNK_SIZE):
+            end_idx = min(start_idx + CHUNK_SIZE, num_tokens)
+            
+            # Slice inputs
+            X_chunk = X[start_idx:end_idx]          # (chunk, d)
+            req_ids_chunk = req_ids[start_idx:end_idx]  # (chunk,)
+            chunk_len = end_idx - start_idx
+            
+            # 1. Compute Bucket IDs for chunk
+            bids_chunk = self._buckets_batched(X_chunk, G)  # (chunk, R)
+            
+            # 2. Compute Global Indices for chunk
+            # GlobalIndex = req * (R * B) + rep * B + bucket
+            req_ids_expanded = req_ids_chunk.unsqueeze(1).expand(-1, self.R)  # (chunk, R)
+            rep_ids = torch.arange(self.R, device=X.device).unsqueeze(0).expand(chunk_len, -1) # (chunk, R)
+            
+            global_indices = (
+                req_ids_expanded * (self.R * self.B) + rep_ids * self.B + bids_chunk
+            ) # (chunk, R)
+            flat_indices = global_indices.reshape(-1)  # (chunk * R,)
+            
+            # 3. Expand X for aggregation
+            # (chunk, d) -> (chunk, R, d) -> (chunk*R, d)
+            X_chunk_expanded = X_chunk.unsqueeze(1).expand(-1, self.R, -1).reshape(-1, self.d)
+            
+            # 4. Accumulate
+            sums.index_add_(0, flat_indices, X_chunk_expanded)
+            
+            # Accumulate counts
+            ones = torch.ones_like(flat_indices, dtype=X.dtype, device=X.device)
+            counts_flat.index_add_(0, flat_indices, ones)
+
+        # Reshape accumulators
+        sums = sums.view(num_reqs, self.R, self.B, self.d)  # (N, R, B, d)
         counts = counts_flat.view(num_reqs, self.R, self.B)  # (N, R, B)
 
         # --- doc/query 모드 분기: sum vs mean ---
@@ -301,7 +323,6 @@ class FDEPooler(Pooler):
             # doc bucket만 mean으로, 나머지는 sum 유지
             blocks_in = torch.where(mask_doc[..., None], means, sums)
 
-            # --- doc 전용 empty bucket fill (옵션) ---
             # --- doc 전용 empty bucket fill (옵션) ---
             if self.cfg.fill_empty_clusters:
                 # Hypercube neighbor fill (쿼리 row는 내부에서 skip됨)
