@@ -13,10 +13,8 @@ RUN apt-get update && apt-get install -y \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv
-ADD https://astral.sh/uv/install.sh /uv-installer.sh
-RUN sh /uv-installer.sh && rm /uv-installer.sh
-ENV PATH="/root/.cargo/bin/:$PATH"
+# Install uv using multi-stage copy (more robust)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # Install Python and create venv using uv
 # vLLM typically supports 3.9-3.12. Using 3.10 as a safe default for compatibility.
