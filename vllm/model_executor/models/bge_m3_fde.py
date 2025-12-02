@@ -84,9 +84,9 @@ class BgeM3FDE(RobertaEmbeddingModel):
                     repo_id=self.model_path, filename="fde_params.pt"
                 )
                 logger.info(f"Downloaded FDE params from HF: {fde_params_path}")
-            except Exception:
-                # Ignore download errors, will fall back to random init
-                pass
+            except Exception as e:
+                # Log warning for debugging, will fall back to random init
+                logger.warning(f"Could not download fde_params.pt from HF: {e}")
 
         if os.path.exists(fde_params_path):
             try:

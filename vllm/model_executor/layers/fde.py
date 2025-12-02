@@ -110,6 +110,9 @@ class FDEPooler(nn.Module):
             if self.final_proj is not None:
                 self.final_proj.register_buffer("W", self.final_proj.W.half())
 
+        # Chunk size for mini-batch processing to prevent OOM
+        self.chunk_size = 65536
+
     # --- 내부 유틸 ---
 
     def _normalize_rows(self, x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:

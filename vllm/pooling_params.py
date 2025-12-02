@@ -56,4 +56,6 @@ class PoolingParams(
     def __repr__(self) -> str:
         return (f"PoolingParams("
                 f"dimensions={self.dimensions}, "
+                f"is_document={self.is_document}, "
+                f"normalize={self.normalize}, "
                 f"additional_metadata={self.additional_data})")
