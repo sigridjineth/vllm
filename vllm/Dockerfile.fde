@@ -34,10 +34,11 @@ RUN uv venv /workspace/.venv
 ENV VIRTUAL_ENV=/workspace/.venv
 ENV PATH="/workspace/.venv/bin:$PATH"
 
-# Install PyTorch 2.6.0 with CUDA 12.1 support
-# PyTorch cu121 wheels are forward-compatible with CUDA 12.3 runtime
+# Install PyTorch 2.6.0 with CUDA 11.8 support
+# PyTorch 2.6.0 only has cu118 and cu124 builds (no cu121)
+# cu118 wheels are forward-compatible with CUDA 12.3 runtime
 RUN uv pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
-    --index-url https://download.pytorch.org/whl/cu121
+    --index-url https://download.pytorch.org/whl/cu118
 
 # Install build dependencies
 RUN uv pip install setuptools wheel cmake ninja packaging setuptools-scm
