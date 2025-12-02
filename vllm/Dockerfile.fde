@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Apache-2.0
+# Dockerfile for vLLM v0.8.5 with MUVERA FDE support
+# Compatible with: L40S (SM89), RTX 3090 (SM86), A100 (SM80)
+#
+# Build: docker build -f vllm/Dockerfile.fde -t vllm-fde:v085 .
+# Run:   docker run --gpus all -p 8000:8000 vllm-fde:v085
+
+# Use NVIDIA CUDA 12.3 base image with cuDNN
+# CUDA 12.3 requires driver >= 545.23 (lower than 12.4's 550.54 requirement)
+FROM docker.io/nvidia/cuda:12.3.2-cudnn9-devel-ubuntu22.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-dev \
+    git \
+    curl \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /workspace
+
+# Install uv for fast Python package management
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+# Create virtual environment
+RUN uv venv /workspace/.venv
+ENV VIRTUAL_ENV=/workspace/.venv
+ENV PATH="/workspace/.venv/bin:$PATH"
+
+# Install PyTorch 2.6.0 with CUDA 12.1 support
+# PyTorch cu121 wheels are forward-compatible with CUDA 12.3 runtime
+RUN uv pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# Install build dependencies
+RUN uv pip install setuptools wheel cmake ninja packaging setuptools-scm
+
+# Copy vLLM source code
+COPY . /workspace/vllm
+
+# Set CUDA architectures for compilation
+# SM80 = A100, SM86 = RTX 3090, SM89 = L40S
+ENV TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9"
+
+# Install vLLM in editable mode
+WORKDIR /workspace/vllm
+RUN uv pip install -e . --no-build-isolation
+
+# Copy FDE conversion script to accessible location
+RUN cp /workspace/vllm/vllm/convert_to_fde_config.py /workspace/convert_to_fde_config.py 2>/dev/null || true
+
+# Set default port
+EXPOSE 8000
+
+# Default command
+CMD ["python3", "-m", "vllm.entrypoints.openai.api_server", "--help"]
