@@ -12,21 +12,27 @@ class PoolingParams(
         msgspec.Struct,
         omit_defaults=True,  # type: ignore[call-arg]
         array_like=True):  # type: ignore[call-arg]
-    """API parameters for pooling models. This is currently a placeholder.
+    """API parameters for pooling models.
 
     Attributes:
         dimensions: Reduce the dimensions of embeddings
                     if model support matryoshka representation.
         additional_data: Any additional data needed for pooling.
+        is_document: Whether this is a document embedding (for FDE pooler).
+        normalize: Whether to L2 normalize the output embeddings.
     """
 
     dimensions: Optional[int] = None
     additional_data: Optional[Any] = None
+    is_document: bool = False
+    normalize: bool = False
 
     def clone(self) -> "PoolingParams":
         """Returns a deep copy of the PoolingParams instance."""
         return PoolingParams(dimensions=self.dimensions,
-                             additional_data=self.additional_data)
+                             additional_data=self.additional_data,
+                             is_document=self.is_document,
+                             normalize=self.normalize)
 
     def verify(self, model_config: "ModelConfig") -> None:
         if self.dimensions is not None:
