@@ -32,26 +32,26 @@ class BatchedParams(nn.Module):
     S: Inner projection matrix
     """
 
-    def __init__(self, d: int, ksim: int, d_proj: int | None, R: int, seed: int):
+    def __init__(self, d: int, ksim: int, d_proj: int | None, R: int,
+                 seed: int):
         super().__init__()
         g = torch.Generator()
         g.manual_seed(seed)
 
         # G: (R, d, ksim)
-        self.register_buffer("G", torch.randn(R, d, ksim, generator=g, device="cpu"))
+        self.register_buffer(
+            "G", torch.randn(R, d, ksim, generator=g, device="cpu"))
 
         # S: (R, d_proj, d) or None
         self.use_proj = bool(d_proj and d_proj > 0 and d_proj != d)
         if self.use_proj:
             # Do not reset seed, continue from current state for independence
             # g.manual_seed(seed)
-            s_init = (
-                torch.randint(
-                    0, 2, (R, d_proj, d), dtype=torch.int8, generator=g, device="cpu"
-                )
-                * 2
-                - 1
-            ).to(torch.float32)
+            s_init = (torch.randint(0,
+                                    2, (R, d_proj, d),
+                                    dtype=torch.int8,
+                                    generator=g,
+                                    device="cpu") * 2 - 1).to(torch.float32)
             self.register_buffer("S", s_init)
         else:
             self.register_buffer("S", None)
@@ -91,35 +91,42 @@ class FDEPooler(nn.Module):
         self.R = config.R_reps
         self.B = 1 << config.ksim
 
-        self.params = BatchedParams(d, config.ksim, config.d_proj, self.R, config.seed)
+        self.params = BatchedParams(d, config.ksim, config.d_proj, self.R,
+                                    config.seed)
 
-        d_block = config.d_proj if (self.params.use_proj and config.d_proj) else d
+        d_block = config.d_proj if (self.params.use_proj
+                                    and config.d_proj) else d
         self.d_block = d_block
         self.d_FDE = self.B * d_block * self.R
 
         if config.d_final:
-            self.final_proj = FinalProjectionStreamer(self.d_FDE, config.d_final)
+            self.final_proj = FinalProjectionStreamer(self.d_FDE,
+                                                      config.d_final)
         else:
             self.final_proj = None
 
         # mixed precision: 파라미터를 half로 저장 (계산은 forward에서 X.dtype에 맞춰 upcast/downcast)
         if config.use_mixed_precision:
-            self.params.register_buffer("G", self.params.G.half())
+            self.params.G = self.params.G.half()
             if self.params.S is not None:
-                self.params.register_buffer("S", self.params.S.half())
+                self.params.S = self.params.S.half()
             if self.final_proj is not None:
-                self.final_proj.register_buffer("W", self.final_proj.W.half())
+                self.final_proj.W = self.final_proj.W.half()
 
         # Chunk size for mini-batch processing to prevent OOM
         self.chunk_size = 65536
 
         # Precompute Hamming distance matrix for global empty bucket filling
         if config.fill_empty_clusters:
-            self.register_buffer("hamming_matrix", self._compute_hamming_matrix(config.ksim), persistent=False)
+            self.register_buffer("hamming_matrix",
+                                 self._compute_hamming_matrix(config.ksim),
+                                 persistent=False)
 
     # --- 내부 유틸 ---
 
-    def _normalize_rows(self, x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    def _normalize_rows(self,
+                        x: torch.Tensor,
+                        eps: float = 1e-6) -> torch.Tensor:
         return x / (x.norm(dim=-1, keepdim=True) + eps)
 
     def _compute_hamming_matrix(self, ksim: int) -> torch.Tensor:
@@ -143,7 +150,8 @@ class FDEPooler(nn.Module):
             dist_matrix += ((xor_matrix & mask) > 0).long()
         return dist_matrix
 
-    def _buckets_batched(self, X: torch.Tensor, G: torch.Tensor) -> torch.Tensor:
+    def _buckets_batched(self, X: torch.Tensor,
+                         G: torch.Tensor) -> torch.Tensor:
         """
         X: (TotalTokens, d)
         G: (R, d, ksim)
@@ -154,26 +162,26 @@ class FDEPooler(nn.Module):
         # logits: (T, R, k)
         logits = torch.einsum("td,Rdk->tRk", X, G)
         bits = (logits > 0).to(torch.int64)
-        powers = 1 << torch.arange(G.size(-1), device=X.device, dtype=torch.int64)
+        powers = 1 << torch.arange(
+            G.size(-1), device=X.device, dtype=torch.int64)
         # (T, R, k) * (k,) -> (T, R)
         return (bits * powers).sum(dim=-1)
 
-    def _project_block_batched(
-        self, blocks: torch.Tensor, S: torch.Tensor | None
-    ) -> torch.Tensor:
+    def _project_block_batched(self, blocks: torch.Tensor,
+                               S: torch.Tensor | None) -> torch.Tensor:
         if S is None:
             return blocks
         # blocks: (N, R, B, d), S: (R, d_proj, d) -> (N, R, B, d_proj)
         # Reference implementation scales by 1/sqrt(d_proj)
         projected = torch.einsum("NRBd,Rpd->NRBp", blocks, S)
         d_proj = S.size(1)
-        return projected * (d_proj ** -0.5)
+        return projected * (d_proj**-0.5)
 
     def _fill_empty_doc_buckets_global(
-        self,
-        centroids: torch.Tensor,  # (N, R, B, d)
-        counts: torch.Tensor,  # (N, R, B)
-        is_document: torch.Tensor,  # (N,)
+            self,
+            centroids: torch.Tensor,  # (N, R, B, d)
+            counts: torch.Tensor,  # (N, R, B)
+            is_document: torch.Tensor,  # (N,)
     ) -> torch.Tensor:
         """
         For doc mode: fill empty buckets using GLOBAL Hamming neighbors.
@@ -184,8 +192,8 @@ class FDEPooler(nn.Module):
         # Ensure hamming matrix is on the correct device
         if self.hamming_matrix.device != device:
             self.hamming_matrix = self.hamming_matrix.to(device)
-        
-        hamming_matrix = self.hamming_matrix # (B, B)
+
+        hamming_matrix = self.hamming_matrix  # (B, B)
 
         for n in range(N):
             if not bool(is_document[n]):  # Skip query rows
@@ -198,23 +206,29 @@ class FDEPooler(nn.Module):
 
                 empty_mask = ~present
                 # Indices of empty and filled buckets
-                empty_indices = torch.nonzero(empty_mask, as_tuple=False).squeeze(-1) # (NumEmpty,)
-                filled_indices = torch.nonzero(present, as_tuple=False).squeeze(-1)   # (NumFilled,)
+                empty_indices = torch.nonzero(
+                    empty_mask, as_tuple=False).squeeze(-1)  # (NumEmpty,)
+                filled_indices = torch.nonzero(
+                    present, as_tuple=False).squeeze(-1)  # (NumFilled,)
 
                 if filled_indices.numel() == 0:
                     # If ALL buckets are empty (rare, e.g. zero tokens?), nothing to fill from.
                     continue
-                
+
                 # Compute distances from each empty bucket to all filled buckets
                 # (NumEmpty, NumFilled)
                 dists = hamming_matrix[empty_indices][:, filled_indices]
-                
+
                 # Find nearest filled bucket for each empty bucket
-                nearest_idx_in_filled = torch.argmin(dists, dim=1) # (NumEmpty,)
-                nearest_filled_buckets = filled_indices[nearest_idx_in_filled] # (NumEmpty,)
+                nearest_idx_in_filled = torch.argmin(dists,
+                                                     dim=1)  # (NumEmpty,)
+                nearest_filled_buckets = filled_indices[
+                    nearest_idx_in_filled]  # (NumEmpty,)
 
                 # Fill
-                centroids[n, r, empty_indices] = centroids[n, r, nearest_filled_buckets]
+                centroids[n, r,
+                          empty_indices] = centroids[n, r,
+                                                     nearest_filled_buckets]
 
         return centroids
 
@@ -238,8 +252,7 @@ class FDEPooler(nn.Module):
         total_tokens = sum(prompt_lens_list)
         assert total_tokens == hidden_states.size(0), (
             f"Sum of prompt_lens ({total_tokens}) "
-            f"does not match hidden_states length ({hidden_states.size(0)})"
-        )
+            f"does not match hidden_states length ({hidden_states.size(0)})")
 
         X = self._normalize_rows(hidden_states)
 
@@ -250,17 +263,21 @@ class FDEPooler(nn.Module):
                 self.final_proj.to(device=X.device, dtype=X.dtype)
 
         # per-request aggregation 준비
-        prompt_lens = torch.tensor(prompt_lens_list, device=X.device, dtype=torch.long)
+        prompt_lens = torch.tensor(prompt_lens_list,
+                                   device=X.device,
+                                   dtype=torch.long)
         num_reqs = len(prompt_lens_list)
 
         # request id per token: [0..0, 1..1, ..., N-1..N-1]
         req_ids = torch.repeat_interleave(
-            torch.arange(num_reqs, device=X.device), prompt_lens
-        )  # (TotalTokens,)
+            torch.arange(num_reqs, device=X.device),
+            prompt_lens)  # (TotalTokens,)
 
         # 요청별 doc/query 플래그 읽기 (v0.8.5 API: seq_groups)
         # seq_groups is List[Tuple[List[int], PoolingParams]]
-        pooling_params = [params for (_, params) in pooling_metadata.seq_groups] if pooling_metadata.seq_groups else []
+        pooling_params = [
+            params for (_, params) in pooling_metadata.seq_groups
+        ] if pooling_metadata.seq_groups else []
         if pooling_params:
             is_document = torch.tensor(
                 [getattr(p, "is_document", False) for p in pooling_params],
@@ -269,7 +286,9 @@ class FDEPooler(nn.Module):
             )  # (N,)
         else:
             # pooling_params 없으면 전부 query로 취급
-            is_document = torch.zeros(num_reqs, device=X.device, dtype=torch.bool)
+            is_document = torch.zeros(num_reqs,
+                                      device=X.device,
+                                      dtype=torch.bool)
 
         # Output dimensions
         out_dim = num_reqs * self.R * self.B
@@ -302,28 +321,28 @@ class FDEPooler(nn.Module):
             # 2. Compute Global Indices for chunk
             # GlobalIndex = req * (R * B) + rep * B + bucket
             req_ids_expanded = req_ids_chunk.unsqueeze(1).expand(
-                -1, self.R
-            )  # (chunk, R)
-            rep_ids = (
-                torch.arange(self.R, device=X.device).unsqueeze(0).expand(chunk_len, -1)
-            )  # (chunk, R)
+                -1, self.R)  # (chunk, R)
+            rep_ids = (torch.arange(self.R,
+                                    device=X.device).unsqueeze(0).expand(
+                                        chunk_len, -1))  # (chunk, R)
 
-            global_indices = (
-                req_ids_expanded * (self.R * self.B) + rep_ids * self.B + bids_chunk
-            )  # (chunk, R)
+            global_indices = (req_ids_expanded * (self.R * self.B) +
+                              rep_ids * self.B + bids_chunk)  # (chunk, R)
             flat_indices = global_indices.reshape(-1)  # (chunk * R,)
 
             # 3. Expand X for aggregation
             # (chunk, d) -> (chunk, R, d) -> (chunk*R, d)
-            X_chunk_expanded = (
-                X_chunk.unsqueeze(1).expand(-1, self.R, -1).reshape(-1, self.d)
-            )
+            X_chunk_expanded = (X_chunk.unsqueeze(1).expand(-1, self.R,
+                                                            -1).reshape(
+                                                                -1, self.d))
 
             # 4. Accumulate
             sums.index_add_(0, flat_indices, X_chunk_expanded)
 
             # Accumulate counts
-            ones = torch.ones_like(flat_indices, dtype=X.dtype, device=X.device)
+            ones = torch.ones_like(flat_indices,
+                                   dtype=X.dtype,
+                                   device=X.device)
             counts_flat.index_add_(0, flat_indices, ones)
 
         # Reshape accumulators
@@ -350,16 +369,16 @@ class FDEPooler(nn.Module):
             if self.cfg.fill_empty_clusters:
                 # Global Hamming neighbor fill (skip query rows internally)
                 blocks_in = self._fill_empty_doc_buckets_global(
-                    blocks_in, counts, is_document
-                )
+                    blocks_in, counts, is_document)
 
         # --- Bucket-level L2 Normalization (MUVERA paper alignment) ---
-        # REMOVED to align with rule-of-thumb reference code
-        # blocks_in = F.normalize(blocks_in, p=2, dim=-1, eps=1e-6)
+        # Restored based on user request (offline consistency)
+        blocks_in = F.normalize(blocks_in, p=2, dim=-1, eps=1e-6)
 
         # Inner projection ψ
         S = self.params.S
-        blocks = self._project_block_batched(blocks_in, S)  # (N, R, B, d_block)
+        blocks = self._project_block_batched(blocks_in,
+                                             S)  # (N, R, B, d_block)
 
         # Flatten to (N, R*B*d_block)
         flat = blocks.reshape(num_reqs, -1)
@@ -371,7 +390,8 @@ class FDEPooler(nn.Module):
             output = flat
 
         # --- optional L2 normalize per request ---
-        if pooling_params and any(bool(getattr(p, 'normalize', False)) for p in pooling_params):
+        if pooling_params and any(
+                bool(getattr(p, 'normalize', False)) for p in pooling_params):
             do_normalize = torch.tensor(
                 [bool(getattr(p, 'normalize', False)) for p in pooling_params],
                 device=output.device,
@@ -381,8 +401,11 @@ class FDEPooler(nn.Module):
                 output = F.normalize(output, p=2, dim=-1)
             elif do_normalize.any():
                 normalized = F.normalize(output, p=2, dim=-1)
-                output = torch.where(do_normalize.unsqueeze(1), normalized, output)
+                output = torch.where(do_normalize.unsqueeze(1), normalized,
+                                     output)
 
         # v0.8.5 API: Return PoolerOutput with PoolingSequenceGroupOutput for each request
-        pooled_outputs = [PoolingSequenceGroupOutput(output[i]) for i in range(num_reqs)]
+        pooled_outputs = [
+            PoolingSequenceGroupOutput(output[i]) for i in range(num_reqs)
+        ]
         return PoolerOutput(outputs=pooled_outputs)
