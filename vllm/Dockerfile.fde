@@ -5,9 +5,9 @@
 # Build: docker build -f vllm/Dockerfile.fde -t vllm-fde:v085 .
 # Run:   docker run --gpus all -p 8000:8000 vllm-fde:v085
 
-# Use NVIDIA CUDA 12.3 base image with cuDNN
-# CUDA 12.3 requires driver >= 545.23 (lower than 12.4's 550.54 requirement)
-FROM docker.io/nvidia/cuda:12.3.2-cudnn9-devel-ubuntu22.04
+# Use NVIDIA CUDA 11.8 base image with cuDNN
+# CUDA 11.8 requires driver >= 520.61 (compatible with driver 535.x on L40S)
+FROM docker.io/nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
@@ -60,5 +60,11 @@ RUN cp /workspace/vllm/vllm/convert_to_fde_config.py /workspace/convert_to_fde_c
 # Set default port
 EXPOSE 8000
 
-# Default command
-CMD ["python3", "-m", "vllm.entrypoints.openai.api_server", "--help"]
+# Default command - ready to run without kubectl patch
+CMD ["python3", "-m", "vllm.entrypoints.openai.api_server", \
+     "--model", "/workspace/bge-m3-fde", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--trust-remote-code", \
+     "--enforce-eager", \
+     "--gpu-memory-utilization", "0.9"]
