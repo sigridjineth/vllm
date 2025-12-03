@@ -15,12 +15,12 @@ from vllm.sequence import PoolerOutput, PoolingSequenceGroupOutput
 
 @dataclass
 class FDEConfig:
-    ksim: int = 6
+    ksim: int = 4
     d_proj: int = 32
-    R_reps: int = 10
+    R_reps: int = 24
     d_final: int | None = None
     # 쿼리에는 기본적으로 쓰지 않는 것을 권장 (doc에만 True)
-    fill_empty_clusters: bool = False
+    fill_empty_clusters: bool = True
     seed: int = 42
     use_mixed_precision: bool = False
 
