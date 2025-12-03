@@ -1,0 +1,86 @@
+I have modified `vllm/entrypoints/openai/protocol.py` to add `is_document` support for FDE (Fixed Dimensional Encoding).
+The goal is to allow users to pass `"is_document": true` in the embedding API request, which should be propagated to `PoolingParams`.
+
+Here are the modified classes `EmbeddingCompletionRequest` and `EmbeddingChatRequest`:
+
+```python
+class EmbeddingCompletionRequest(OpenAIBaseModel):
+    # Ordered by official OpenAI API documentation
+    # https://platform.openai.com/docs/api-reference/embeddings
+    model: Optional[str] = None
+    input: Union[list[int], list[list[int]], str, list[str]]
+    encoding_format: Literal["float", "base64"] = "float"
+    dimensions: Optional[int] = None
+    user: Optional[str] = None
+    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+    # doc: begin-embedding-pooling-params
+    additional_data: Optional[Any] = None
+    is_document: bool = False
+    # doc: end-embedding-pooling-params
+
+    # doc: begin-embedding-extra-params
+    add_special_tokens: bool = Field(
+        default=True,
+        description=(
+            "If true (the default), special tokens (e.g. BOS) will be added to "
+            "the prompt."),
+    )
+    priority: int = Field(
+        default=0,
+        description=(
+            "The priority of the request (lower means earlier handling; "
+            "default: 0). Any priority other than 0 will raise an error "
+            "if the served model does not use priority scheduling."),
+    )
+
+    # doc: end-embedding-extra-params
+
+    def to_pooling_params(self):
+        return PoolingParams(dimensions=self.dimensions,
+                             additional_data=self.additional_data,
+                             is_document=self.is_document)
+
+
+class EmbeddingChatRequest(OpenAIBaseModel):
+    model: Optional[str] = None
+    messages: list[ChatCompletionMessageParam]
+
+    encoding_format: Literal["float", "base64"] = "float"
+    dimensions: Optional[int] = None
+    user: Optional[str] = None
+    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+
+    # doc: begin-chat-embedding-pooling-params
+    additional_data: Optional[Any] = None
+    is_document: bool = False
+    # doc: end-chat-embedding-pooling-params
+
+    # doc: begin-chat-embedding-extra-params
+    add_special_tokens: bool = Field(
+        default=False,
+        description=(
+            "If true, special tokens (e.g. BOS) will be added to the prompt "
+            "on top of what is added by the chat template. "
+            "For most models, the chat template takes care of adding the "
+            "special tokens so this should be set to false (as is the "
+            "default)."),
+    )
+    # ... (other fields omitted for brevity) ...
+    priority: int = Field(
+        default=0,
+        description=(
+            "The priority of the request (lower means earlier handling; "
+            "default: 0). Any priority other than 0 will raise an error "
+            "if the served model does not use priority scheduling."),
+    )
+    # doc: end-chat-embedding-extra-params
+
+    # ... (validators omitted) ...
+
+    def to_pooling_params(self):
+        return PoolingParams(dimensions=self.dimensions,
+                             additional_data=self.additional_data,
+                             is_document=self.is_document)
+```
+
+Please review if this implementation correctly exposes the parameter and passes it to `PoolingParams`.

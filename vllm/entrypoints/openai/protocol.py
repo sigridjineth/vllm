@@ -1020,8 +1020,7 @@ class EmbeddingCompletionRequest(OpenAIBaseModel):
     is_document: bool = Field(
         default=False,
         description="Whether this input represents a document (for FDE models). "
-                    "Set to true for corpus documents, false for queries."
-    )
+        "Set to true for corpus documents, false for queries.")
     # doc: end-embedding-pooling-params
 
     # doc: begin-embedding-extra-params
@@ -1061,8 +1060,7 @@ class EmbeddingChatRequest(OpenAIBaseModel):
     is_document: bool = Field(
         default=False,
         description="Whether this input represents a document (for FDE models). "
-                    "Set to true for corpus documents, false for queries."
-    )
+        "Set to true for corpus documents, false for queries.")
     # doc: end-chat-embedding-pooling-params
 
     # doc: begin-chat-embedding-extra-params

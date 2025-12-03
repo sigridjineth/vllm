@@ -1,0 +1,4168 @@
+--- START OF FILE: vllm/check_fde_import.py ---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import sys
+
+# Add current directory to path
+sys.path.append(os.getcwd())
+
+from unittest.mock import MagicMock
+
+sys.modules["psutil"] = MagicMock()
+sys.modules["zmq"] = MagicMock()
+sys.modules["zmq.asyncio"] = MagicMock()
+sys.modules["transformers"] = MagicMock()
+sys.modules["transformers.configuration_utils"] = MagicMock()
+sys.modules["transformers.models"] = MagicMock()
+sys.modules["transformers.models.roberta"] = MagicMock()
+sys.modules["cbor2"] = MagicMock()
+sys.modules["huggingface_hub"] = MagicMock()
+
+try:
+    print("Importing FDEPooler...")
+    print("Importing BgeM3FDE...")
+    print("Imports successful!")
+except Exception as e:
+    print(f"Import failed: {e}")
+    sys.exit(1)
+
+--- END OF FILE: vllm/check_fde_import.py ---
+
+--- START OF FILE: vllm/convert_to_fde_config.py ---
+import argparse
+import json
+import os
+from huggingface_hub import snapshot_download
+
+def main():
+    parser = argparse.ArgumentParser(description="Convert BGE-M3 model config to enable FDE in vLLM")
+    parser.add_argument("--model", type=str, required=True, help="Source model (HF Hub ID or local path), e.g., BAAI/bge-m3")
+    parser.add_argument("--output", type=str, required=True, help="Output directory for the FDE-enabled model")
+    parser.add_argument("--ksim", type=int, default=6, help="FDE ksim parameter")
+    parser.add_argument("--d_proj", type=int, default=32, help="FDE d_proj parameter")
+    parser.add_argument("--R_reps", type=int, default=10, help="FDE R_reps parameter")
+    parser.add_argument("--d_final", type=int, default=None, help="FDE d_final parameter (output dimension). If None, no final projection is applied (recommended unless dimensionality reduction is needed).")
+    parser.add_argument("--fill_empty_clusters", action="store_true", help="Enable empty cluster filling (default: False)")
+    
+    args = parser.parse_args()
+    
+    print(f"Downloading/Copying model from {args.model} to {args.output}...")
+    # Download everything except safetensors/bin if we want to save space? 
+    # No, vLLM needs weights. We should download/copy everything.
+    # Using ignore_patterns to avoid downloading huge files if user just wants config? 
+    # No, user needs to serve it.
+    
+    try:
+        snapshot_download(repo_id=args.model, local_dir=args.output, local_dir_use_symlinks=False)
+    except Exception as e:
+        # If it's a local path, snapshot_download might fail or we should just copy.
+        if os.path.isdir(args.model):
+            import shutil
+            shutil.copytree(args.model, args.output, dirs_exist_ok=True)
+        else:
+            raise e
+
+    config_path = os.path.join(args.output, "config.json")
+    with open(config_path, "r") as f:
+        config = json.load(f)
+        
+    # Modify Architecture
+    print("Modifying config.json...")
+    config["architectures"] = ["BgeM3FDE"]
+    
+    # Add FDE Config
+    config["fde_config"] = {
+        "ksim": args.ksim,
+        "d_proj": args.d_proj,
+        "R_reps": args.R_reps,
+        "d_final": args.d_final, # Use provided d_final (None by default)
+        "fill_empty_clusters": args.fill_empty_clusters,
+        "seed": 42
+    }
+    
+    # Save
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+        
+    print("Generating FDE parameters...")
+    try:
+        import torch
+        # We need to import FDEPooler and FDEConfig to generate params correctly
+        # Assuming vllm is installed in editable mode or available in path
+        from vllm.model_executor.layers.fde import FDEPooler, FDEConfig
+        
+        fde_config = FDEConfig(
+            ksim=args.ksim,
+            d_proj=args.d_proj,
+            R_reps=args.R_reps,
+            d_final=config["fde_config"]["d_final"],
+            fill_empty_clusters=args.fill_empty_clusters,
+            seed=42,
+            use_mixed_precision=False # Save as float32 for compatibility
+        )
+        
+        # Initialize pooler to generate params
+        # We need hidden_size from config
+        hidden_size = config["hidden_size"]
+        pooler = FDEPooler(d=hidden_size, config=fde_config)
+        
+        # Extract params
+        state_dict = {}
+        state_dict["G"] = pooler.params.G
+        if pooler.params.S is not None:
+            state_dict["S"] = pooler.params.S
+        if pooler.final_proj is not None:
+            state_dict["W"] = pooler.final_proj.W
+            
+        # Save to fde_params.pt
+        params_path = os.path.join(args.output, "fde_params.pt")
+        torch.save(state_dict, params_path)
+        print(f"FDE parameters saved to {params_path}")
+        
+    except ImportError:
+        print("Warning: Could not import vllm to generate FDE params. You will see a warning when loading the model.")
+    except Exception as e:
+        print(f"Warning: Failed to generate FDE params: {e}")
+
+    print(f"Success! FDE-enabled model saved to {args.output}")
+    print(f"Run vLLM with: vllm serve {args.output} --trust-remote-code")
+
+if __name__ == "__main__":
+    main()
+
+--- END OF FILE: vllm/convert_to_fde_config.py ---
+
+--- START OF FILE: vllm/model_executor/layers/fde.py ---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from vllm.model_executor.pooling_metadata import PoolingMetadata
+from vllm.sequence import PoolerOutput, PoolingSequenceGroupOutput
+
+
+@dataclass
+class FDEConfig:
+    ksim: int = 6
+    d_proj: int = 32
+    R_reps: int = 10
+    d_final: int | None = None
+    # 쿼리에는 기본적으로 쓰지 않는 것을 권장 (doc에만 True)
+    fill_empty_clusters: bool = False
+    seed: int = 42
+    use_mixed_precision: bool = False
+
+
+class BatchedParams(nn.Module):
+    """
+    Holds the (fixed) parameters for FDE:
+    G: SimHash directions
+    S: Inner projection matrix
+    """
+
+    def __init__(self, d: int, ksim: int, d_proj: int | None, R: int, seed: int):
+        super().__init__()
+        g = torch.Generator()
+        g.manual_seed(seed)
+
+        # G: (R, d, ksim)
+        self.register_buffer("G", torch.randn(R, d, ksim, generator=g, device="cpu"))
+
+        # S: (R, d_proj, d) or None
+        self.use_proj = bool(d_proj and d_proj > 0 and d_proj != d)
+        if self.use_proj:
+            # Do not reset seed, continue from current state for independence
+            # g.manual_seed(seed)
+            s_init = (
+                torch.randint(
+                    0, 2, (R, d_proj, d), dtype=torch.int8, generator=g, device="cpu"
+                )
+                * 2
+                - 1
+            ).to(torch.float32)
+            self.register_buffer("S", s_init)
+        else:
+            self.register_buffer("S", None)
+
+
+class FinalProjectionStreamer(nn.Module):
+    """
+    Holds the final projection matrix W.
+    """
+
+    def __init__(self, d_in: int, d_out: int):
+        super().__init__()
+        self.d_in = d_in
+        self.d_out = d_out
+        self.register_buffer("W", torch.randn(d_out, d_in))
+
+    def forward(self, x_flat: torch.Tensor) -> torch.Tensor:
+        # x_flat: (Batch, D_in)
+        # W: (D_out, D_in)
+        # Output: (Batch, D_out)
+        return x_flat @ self.W.t()
+
+
+class FDEPooler(nn.Module):
+    """
+    MUVERA-style FDE Pooler (쿼리/문서 둘 다 지원).
+    - 쿼리(request with is_document=False):
+        per-bucket sum (Fq)
+    - 문서(request with is_document=True):
+        per-bucket mean (Fdoc) + 선택적 empty bucket fill
+    """
+
+    def __init__(self, d: int, config: FDEConfig):
+        super().__init__()
+        self.d = d
+        self.cfg = config
+        self.R = config.R_reps
+        self.B = 1 << config.ksim
+
+        self.params = BatchedParams(d, config.ksim, config.d_proj, self.R, config.seed)
+
+        d_block = config.d_proj if (self.params.use_proj and config.d_proj) else d
+        self.d_block = d_block
+        self.d_FDE = self.B * d_block * self.R
+
+        if config.d_final:
+            self.final_proj = FinalProjectionStreamer(self.d_FDE, config.d_final)
+        else:
+            self.final_proj = None
+
+        # mixed precision: 파라미터를 half로 저장 (계산은 forward에서 X.dtype에 맞춰 upcast/downcast)
+        if config.use_mixed_precision:
+            self.params.register_buffer("G", self.params.G.half())
+            if self.params.S is not None:
+                self.params.register_buffer("S", self.params.S.half())
+            if self.final_proj is not None:
+                self.final_proj.register_buffer("W", self.final_proj.W.half())
+
+        # Chunk size for mini-batch processing to prevent OOM
+        self.chunk_size = 65536
+
+    # --- 내부 유틸 ---
+
+    def _normalize_rows(self, x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        return x / (x.norm(dim=-1, keepdim=True) + eps)
+
+    def _buckets_batched(self, X: torch.Tensor, G: torch.Tensor) -> torch.Tensor:
+        """
+        X: (TotalTokens, d)
+        G: (R, d, ksim)
+        returns: bucket ids (TotalTokens, R) -> values in [0, B-1]
+        """
+        # X: (T, d)
+        # G: (R, d, k)
+        # logits: (T, R, k)
+        logits = torch.einsum("td,Rdk->tRk", X, G)
+        bits = (logits > 0).to(torch.int64)
+        powers = 1 << torch.arange(G.size(-1), device=X.device, dtype=torch.int64)
+        # (T, R, k) * (k,) -> (T, R)
+        return (bits * powers).sum(dim=-1)
+
+    def _project_block_batched(
+        self, blocks: torch.Tensor, S: torch.Tensor | None
+    ) -> torch.Tensor:
+        if S is None:
+            return blocks
+        # blocks: (N, R, B, d), S: (R, d_proj, d) -> (N, R, B, d_proj)
+        return torch.einsum("NRBd,Rpd->NRBp", blocks, S)
+
+    def _fill_empty_doc_buckets_hcube(
+        self,
+        centroids: torch.Tensor,  # (N, R, B, d)
+        counts: torch.Tensor,  # (N, R, B)
+        is_document: torch.Tensor,  # (N,)
+    ) -> torch.Tensor:
+        """
+        For doc mode: fill empty buckets using Hamming neighbors in the SimHash hypercube.
+        Strategy:
+          - radius 1 neighbors first
+          - if none present, radius 2
+          - else leave as is (rare)
+        """
+        N, R, B, d = centroids.shape
+        ksim = self.cfg.ksim
+        device = centroids.device
+
+        masks = 1 << torch.arange(ksim, device=device, dtype=torch.long)  # (ksim,)
+
+        for n in range(N):
+            if not bool(is_document[n]):  # 쿼리 row는 skip
+                continue
+
+            for r in range(R):
+                present = counts[n, r] > 0  # (B,)
+                if present.all():
+                    continue
+
+                empty_mask = ~present
+                empty_idx = torch.nonzero(empty_mask, as_tuple=False).squeeze(-1)
+                if empty_idx.numel() == 0:
+                    continue
+
+                for b in empty_idx.tolist():
+                    b_val = int(b)
+
+                    # ---- radius 1 ----
+                    n1 = (b_val ^ masks).clamp_(0, B - 1)  # (ksim,)
+                    cand = n1[present[n1]]
+                    if cand.numel() > 0:
+                        centroids[n, r, b] = centroids[n, r, int(cand[0])]
+                        continue
+
+                    # ---- radius 2 ----
+                    found = False
+                    for i in range(ksim):
+                        if found:
+                            break
+                        mi = int(masks[i])
+                        for j in range(i + 1, ksim):
+                            nb = b_val ^ mi ^ int(masks[j])
+                            if 0 <= nb < B and present[nb]:
+                                centroids[n, r, b] = centroids[n, r, nb]
+                                found = True
+                                break
+        return centroids
+
+    # --- main forward ---
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor | list[torch.Tensor],
+        pooling_metadata: PoolingMetadata,
+    ) -> PoolerOutput:
+        """
+        hidden_states: (TotalTokens, d) - flattened across all requests
+        pooling_metadata: contains prompt_lens, seq_groups (per request)
+        """
+        if isinstance(hidden_states, list):
+            hidden_states = torch.cat(hidden_states, dim=0)
+
+        # v0.8.5 API: prompt_lens is List[int], convert to tensor
+        prompt_lens_list: List[int] = pooling_metadata.prompt_lens
+        assert prompt_lens_list is not None, "prompt_lens must not be None"
+        total_tokens = sum(prompt_lens_list)
+        assert total_tokens == hidden_states.size(0), (
+            f"Sum of prompt_lens ({total_tokens}) "
+            f"does not match hidden_states length ({hidden_states.size(0)})"
+        )
+
+        X = self._normalize_rows(hidden_states)
+
+        # params를 X와 같은 device/dtype으로 맞춰주기
+        if self.params.G.device != X.device or self.params.G.dtype != X.dtype:
+            self.params.to(device=X.device, dtype=X.dtype)
+            if self.final_proj is not None:
+                self.final_proj.to(device=X.device, dtype=X.dtype)
+
+        # per-request aggregation 준비
+        prompt_lens = torch.tensor(prompt_lens_list, device=X.device, dtype=torch.long)
+        num_reqs = len(prompt_lens_list)
+
+        # request id per token: [0..0, 1..1, ..., N-1..N-1]
+        req_ids = torch.repeat_interleave(
+            torch.arange(num_reqs, device=X.device), prompt_lens
+        )  # (TotalTokens,)
+
+        # 요청별 doc/query 플래그 읽기 (v0.8.5 API: seq_groups)
+        # seq_groups is List[Tuple[List[int], PoolingParams]]
+        pooling_params = [params for (_, params) in pooling_metadata.seq_groups] if pooling_metadata.seq_groups else []
+        if pooling_params:
+            is_document = torch.tensor(
+                [getattr(p, "is_document", False) for p in pooling_params],
+                device=X.device,
+                dtype=torch.bool,
+            )  # (N,)
+        else:
+            # pooling_params 없으면 전부 query로 취급
+            is_document = torch.zeros(num_reqs, device=X.device, dtype=torch.bool)
+
+        # Output dimensions
+        out_dim = num_reqs * self.R * self.B
+
+        # Initialize global accumulators
+        sums = torch.zeros((out_dim, self.d), device=X.device, dtype=X.dtype)
+        counts_flat = torch.zeros(out_dim, dtype=X.dtype, device=X.device)
+
+        # Mini-batch configuration
+        # 65536 tokens * 10 reps * 128 dim * 2 bytes (fp16) ~= 160MB per chunk expansion
+        chunk_size = self.chunk_size
+        num_tokens = X.size(0)
+
+        G = self.params.G  # (R, d, ksim)
+
+        # Pre-compute rep_ids for expansion (reused in loop if size matches, but cheap to make)
+        # We need rep_ids of shape (chunk_size, R)
+
+        for start_idx in range(0, num_tokens, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_tokens)
+
+            # Slice inputs
+            X_chunk = X[start_idx:end_idx]  # (chunk, d)
+            req_ids_chunk = req_ids[start_idx:end_idx]  # (chunk,)
+            chunk_len = end_idx - start_idx
+
+            # 1. Compute Bucket IDs for chunk
+            bids_chunk = self._buckets_batched(X_chunk, G)  # (chunk, R)
+
+            # 2. Compute Global Indices for chunk
+            # GlobalIndex = req * (R * B) + rep * B + bucket
+            req_ids_expanded = req_ids_chunk.unsqueeze(1).expand(
+                -1, self.R
+            )  # (chunk, R)
+            rep_ids = (
+                torch.arange(self.R, device=X.device).unsqueeze(0).expand(chunk_len, -1)
+            )  # (chunk, R)
+
+            global_indices = (
+                req_ids_expanded * (self.R * self.B) + rep_ids * self.B + bids_chunk
+            )  # (chunk, R)
+            flat_indices = global_indices.reshape(-1)  # (chunk * R,)
+
+            # 3. Expand X for aggregation
+            # (chunk, d) -> (chunk, R, d) -> (chunk*R, d)
+            X_chunk_expanded = (
+                X_chunk.unsqueeze(1).expand(-1, self.R, -1).reshape(-1, self.d)
+            )
+
+            # 4. Accumulate
+            sums.index_add_(0, flat_indices, X_chunk_expanded)
+
+            # Accumulate counts
+            ones = torch.ones_like(flat_indices, dtype=X.dtype, device=X.device)
+            counts_flat.index_add_(0, flat_indices, ones)
+
+        # Reshape accumulators
+        sums = sums.view(num_reqs, self.R, self.B, self.d)  # (N, R, B, d)
+        counts = counts_flat.view(num_reqs, self.R, self.B)  # (N, R, B)
+
+        # --- doc/query 모드 분기: sum vs mean ---
+
+        # 기본은 query 모드: sum
+        blocks_in = sums
+
+        if is_document.any():
+            # doc row는 per-bucket mean 사용
+            counts_safe = counts.clamp_min(1.0)[..., None]  # (N, R, B, 1)
+            means = sums / counts_safe  # (N, R, B, d)
+
+            is_doc_3d = is_document.view(num_reqs, 1, 1)  # (N,1,1)
+            mask_doc = is_doc_3d.expand_as(counts)  # (N,R,B)
+
+            # doc bucket만 mean으로, 나머지는 sum 유지
+            blocks_in = torch.where(mask_doc[..., None], means, sums)
+
+            # --- doc 전용 empty bucket fill (옵션) ---
+            if self.cfg.fill_empty_clusters:
+                # Hypercube neighbor fill (쿼리 row는 내부에서 skip됨)
+                blocks_in = self._fill_empty_doc_buckets_hcube(
+                    blocks_in, counts, is_document
+                )
+
+        # --- Bucket-level L2 Normalization (MUVERA paper alignment) ---
+        # Use eps=1e-6 to avoid NaN in fp16 when buckets are empty (zero vectors)
+        blocks_in = F.normalize(blocks_in, p=2, dim=-1, eps=1e-6)
+
+        # Inner projection ψ
+        S = self.params.S
+        blocks = self._project_block_batched(blocks_in, S)  # (N, R, B, d_block)
+
+        # Flatten to (N, R*B*d_block)
+        flat = blocks.reshape(num_reqs, -1)
+
+        # Final projection ψ'
+        if self.final_proj:
+            output = self.final_proj(flat)
+        else:
+            output = flat
+
+        # --- optional L2 normalize per request ---
+        if pooling_params and any(bool(getattr(p, 'normalize', False)) for p in pooling_params):
+            do_normalize = torch.tensor(
+                [bool(getattr(p, 'normalize', False)) for p in pooling_params],
+                device=output.device,
+                dtype=torch.bool,
+            )  # (N,)
+            if do_normalize.all():
+                output = F.normalize(output, p=2, dim=-1)
+            elif do_normalize.any():
+                normalized = F.normalize(output, p=2, dim=-1)
+                output = torch.where(do_normalize.unsqueeze(1), normalized, output)
+
+        # v0.8.5 API: Return PoolerOutput with PoolingSequenceGroupOutput for each request
+        pooled_outputs = [PoolingSequenceGroupOutput(output[i]) for i in range(num_reqs)]
+        return PoolerOutput(outputs=pooled_outputs)
+
+--- END OF FILE: vllm/model_executor/layers/fde.py ---
+
+--- START OF FILE: vllm/model_executor/models/bge_m3_fde.py ---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import os
+from collections.abc import Iterable
+
+import torch
+
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fde import FDEConfig, FDEPooler
+from vllm.model_executor.models.roberta import RobertaEmbeddingModel
+from vllm.sequence import IntermediateTensors
+
+logger = init_logger(__name__)
+
+
+class BgeM3FDE(RobertaEmbeddingModel):
+    """
+    BGE-M3 model with FDE (Fixed Dimensional Encoding) layer.
+    Inherits from RobertaEmbeddingModel as BGE-M3 is based on XLM-RoBERTa.
+    """
+
+    is_pooling_model = True
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+        # FDE Configuration
+        hf_config = vllm_config.model_config.hf_config
+        fde_cfg_dict = getattr(hf_config, "fde_config", {})
+
+        self.fde_config = FDEConfig(
+            ksim=fde_cfg_dict.get("ksim", 6),
+            d_proj=fde_cfg_dict.get("d_proj", 32),
+            R_reps=fde_cfg_dict.get("R_reps", 10),
+            d_final=fde_cfg_dict.get("d_final", None),
+            fill_empty_clusters=fde_cfg_dict.get("fill_empty_clusters", True),
+            seed=fde_cfg_dict.get("seed", 42),
+            use_mixed_precision=fde_cfg_dict.get("use_mixed_precision", False),
+        )
+
+        # Initialize FDE Pooler
+        # We override the default pooler if any
+        self.pooler = FDEPooler(d=hf_config.hidden_size, config=self.fde_config)
+
+        self.model_path = vllm_config.model_config.model
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Get token embeddings from the base RoBERTa model
+        # RobertaEmbeddingModel.forward calls self.model(...) which returns hidden_states
+        hidden_states = super().forward(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
+
+        # We return hidden_states. The ModelRunner will call self.pooler(hidden_states, pooling_metadata)
+        return hidden_states
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        # Load base model weights
+        # Convert weights to list to avoid exhaustion if we needed to iterate twice
+        # (though here we don't, but it's safer)
+        weights_list = list(weights)
+        super().load_weights(weights_list)
+
+        # Load FDE parameters
+        fde_params_path = os.path.join(self.model_path, "fde_params.pt")
+
+        if not os.path.exists(fde_params_path):
+            # If path doesn't exist, it might be a HF repo ID. Try to download.
+            try:
+                from huggingface_hub import hf_hub_download
+
+                fde_params_path = hf_hub_download(
+                    repo_id=self.model_path, filename="fde_params.pt"
+                )
+                logger.info(f"Downloaded FDE params from HF: {fde_params_path}")
+            except Exception as e:
+                # Log warning for debugging, will fall back to random init
+                logger.warning(f"Could not download fde_params.pt from HF: {e}")
+
+        if os.path.exists(fde_params_path):
+            try:
+                # Load to CPU first
+                fde_state = torch.load(
+                    fde_params_path, map_location="cpu", weights_only=True
+                )
+
+                new_state_dict = {}
+                if "G" in fde_state:
+                    new_state_dict["params.G"] = fde_state["G"]
+                if "S" in fde_state:
+                    new_state_dict["params.S"] = fde_state["S"]
+                if "W" in fde_state and self.pooler.final_proj is not None:
+                    new_state_dict["final_proj.W"] = fde_state["W"]
+
+                # Load into pooler
+                missing, unexpected = self.pooler.load_state_dict(
+                    new_state_dict, strict=False
+                )
+                if missing:
+                    logger.warning(f"Missing FDE keys: {missing}")
+                if unexpected:
+                    logger.warning(f"Unexpected FDE keys: {unexpected}")
+
+                # Verify shapes if G was loaded
+                if "params.G" in new_state_dict:
+                    assert (
+                        self.pooler.params.G.shape == new_state_dict["params.G"].shape
+                    ), (
+                        f"Shape mismatch for G: {self.pooler.params.G.shape} vs {new_state_dict['params.G'].shape}"
+                    )
+
+                logger.info(f"Successfully loaded FDE params from {fde_params_path}")
+
+            except Exception as e:
+                logger.error(f"Error loading FDE params from {fde_params_path}: {e}")
+        else:
+            logger.warning(
+                f"fde_params.pt not found at {self.model_path} or HF. FDE parameters initialized randomly."
+            )
+
+--- END OF FILE: vllm/model_executor/models/bge_m3_fde.py ---
+
+--- START OF FILE: vllm/model_executor/models/registry.py ---
+# SPDX-License-Identifier: Apache-2.0
+"""
+Whenever you add an architecture to this page, please also update
+`tests/models/registry.py` with example HuggingFace models for it.
+"""
+import importlib
+import os
+import pickle
+import subprocess
+import sys
+import tempfile
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from functools import lru_cache
+from typing import (AbstractSet, Callable, Dict, List, Optional, Tuple, Type,
+                    TypeVar, Union)
+
+import cloudpickle
+import torch.nn as nn
+
+from vllm.logger import init_logger
+from vllm.utils import is_in_doc_build
+
+from .interfaces import (has_inner_state, has_noops, is_attention_free,
+                         is_hybrid, supports_cross_encoding,
+                         supports_multimodal, supports_pp,
+                         supports_transcription, supports_v0_only)
+from .interfaces_base import is_text_generation_model
+
+logger = init_logger(__name__)
+
+# yapf: disable
+_TEXT_GENERATION_MODELS = {
+    # [Decoder-only]
+    "AquilaModel": ("llama", "LlamaForCausalLM"),
+    "AquilaForCausalLM": ("llama", "LlamaForCausalLM"),  # AquilaChat2
+    "ArcticForCausalLM": ("arctic", "ArcticForCausalLM"),
+    "MiniMaxText01ForCausalLM": ("minimax_text_01", "MiniMaxText01ForCausalLM"),
+    # baichuan-7b, upper case 'C' in the class name
+    "BaiChuanForCausalLM": ("baichuan", "BaiChuanForCausalLM"),
+    # baichuan-13b, lower case 'c' in the class name
+    "BaichuanForCausalLM": ("baichuan", "BaichuanForCausalLM"),
+    "BambaForCausalLM": ("bamba", "BambaForCausalLM"),
+    "BloomForCausalLM": ("bloom", "BloomForCausalLM"),
+    "ChatGLMModel": ("chatglm", "ChatGLMForCausalLM"),
+    "ChatGLMForConditionalGeneration": ("chatglm", "ChatGLMForCausalLM"),
+    "CohereForCausalLM": ("commandr", "CohereForCausalLM"),
+    "Cohere2ForCausalLM": ("commandr", "CohereForCausalLM"),
+    "DbrxForCausalLM": ("dbrx", "DbrxForCausalLM"),
+    "DeciLMForCausalLM": ("nemotron_nas", "DeciLMForCausalLM"),
+    "DeepseekForCausalLM": ("deepseek", "DeepseekForCausalLM"),
+    "DeepseekV2ForCausalLM": ("deepseek_v2", "DeepseekV2ForCausalLM"),
+    "DeepseekV3ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
+    "ExaoneForCausalLM": ("exaone", "ExaoneForCausalLM"),
+    "FalconForCausalLM": ("falcon", "FalconForCausalLM"),
+    "Fairseq2LlamaForCausalLM": ("fairseq2_llama", "Fairseq2LlamaForCausalLM"),
+    "GemmaForCausalLM": ("gemma", "GemmaForCausalLM"),
+    "Gemma2ForCausalLM": ("gemma2", "Gemma2ForCausalLM"),
+    "Gemma3ForCausalLM": ("gemma3", "Gemma3ForCausalLM"),
+    "GlmForCausalLM": ("glm", "GlmForCausalLM"),
+    "Glm4ForCausalLM": ("glm4", "Glm4ForCausalLM"),
+    "GPT2LMHeadModel": ("gpt2", "GPT2LMHeadModel"),
+    "GPTBigCodeForCausalLM": ("gpt_bigcode", "GPTBigCodeForCausalLM"),
+    "GPTJForCausalLM": ("gpt_j", "GPTJForCausalLM"),
+    "GPTNeoXForCausalLM": ("gpt_neox", "GPTNeoXForCausalLM"),
+    "GraniteForCausalLM": ("granite", "GraniteForCausalLM"),
+    "GraniteMoeForCausalLM": ("granitemoe", "GraniteMoeForCausalLM"),
+    "GraniteMoeSharedForCausalLM": ("granitemoeshared", "GraniteMoeSharedForCausalLM"),   # noqa: E501
+    "GritLM": ("gritlm", "GritLM"),
+    "Grok1ModelForCausalLM": ("grok1", "Grok1ForCausalLM"),
+    "InternLMForCausalLM": ("llama", "LlamaForCausalLM"),
+    "InternLM2ForCausalLM": ("internlm2", "InternLM2ForCausalLM"),
+    "InternLM2VEForCausalLM": ("internlm2_ve", "InternLM2VEForCausalLM"),
+    "InternLM3ForCausalLM": ("llama", "LlamaForCausalLM"),
+    "JAISLMHeadModel": ("jais", "JAISLMHeadModel"),
+    "JambaForCausalLM": ("jamba", "JambaForCausalLM"),
+    "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
+    # For decapoda-research/llama-*
+    "LLaMAForCausalLM": ("llama", "LlamaForCausalLM"),
+    "MambaForCausalLM": ("mamba", "MambaForCausalLM"),
+    "FalconMambaForCausalLM": ("mamba", "MambaForCausalLM"),
+    "Mamba2ForCausalLM": ("mamba2", "Mamba2ForCausalLM"),
+    "MiniCPMForCausalLM": ("minicpm", "MiniCPMForCausalLM"),
+    "MiniCPM3ForCausalLM": ("minicpm3", "MiniCPM3ForCausalLM"),
+    "MistralForCausalLM": ("llama", "LlamaForCausalLM"),
+    "MixtralForCausalLM": ("mixtral", "MixtralForCausalLM"),
+    "QuantMixtralForCausalLM": ("mixtral_quant", "MixtralForCausalLM"),
+    # transformers's mpt class has lower case
+    "MptForCausalLM": ("mpt", "MPTForCausalLM"),
+    "MPTForCausalLM": ("mpt", "MPTForCausalLM"),
+    "NemotronForCausalLM": ("nemotron", "NemotronForCausalLM"),
+    "OlmoForCausalLM": ("olmo", "OlmoForCausalLM"),
+    "Olmo2ForCausalLM": ("olmo2", "Olmo2ForCausalLM"),
+    "OlmoeForCausalLM": ("olmoe", "OlmoeForCausalLM"),
+    "OPTForCausalLM": ("opt", "OPTForCausalLM"),
+    "OrionForCausalLM": ("orion", "OrionForCausalLM"),
+    "PersimmonForCausalLM": ("persimmon", "PersimmonForCausalLM"),
+    "PhiForCausalLM": ("phi", "PhiForCausalLM"),
+    "Phi3ForCausalLM": ("phi3", "Phi3ForCausalLM"),
+    "Phi3SmallForCausalLM": ("phi3_small", "Phi3SmallForCausalLM"),
+    "PhiMoEForCausalLM": ("phimoe", "PhiMoEForCausalLM"),
+    "Plamo2ForCausalLM": ("plamo2", "Plamo2ForCausalLM"),
+    "QWenLMHeadModel": ("qwen", "QWenLMHeadModel"),
+    "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
+    "Qwen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeForCausalLM"),
+    "Qwen3ForCausalLM": ("qwen3", "Qwen3ForCausalLM"),
+    "Qwen3MoeForCausalLM": ("qwen3_moe", "Qwen3MoeForCausalLM"),
+    "RWForCausalLM": ("falcon", "FalconForCausalLM"),
+    "StableLMEpochForCausalLM": ("stablelm", "StablelmForCausalLM"),
+    "StableLmForCausalLM": ("stablelm", "StablelmForCausalLM"),
+    "Starcoder2ForCausalLM": ("starcoder2", "Starcoder2ForCausalLM"),
+    "SolarForCausalLM": ("solar", "SolarForCausalLM"),
+    "TeleChat2ForCausalLM": ("telechat2", "TeleChat2ForCausalLM"),
+    "TeleFLMForCausalLM": ("teleflm", "TeleFLMForCausalLM"),
+    "XverseForCausalLM": ("llama", "LlamaForCausalLM"),
+    "Zamba2ForCausalLM": ("zamba2", "Zamba2ForCausalLM"),
+    # [Encoder-decoder]
+    "BartModel": ("bart", "BartForConditionalGeneration"),
+    "BartForConditionalGeneration": ("bart", "BartForConditionalGeneration"),
+}
+
+_EMBEDDING_MODELS = {
+    # [Text-only]
+    "BertModel": ("bert", "BertEmbeddingModel"),
+    "BgeM3FDE": ("bge_m3_fde", "BgeM3FDE"),
+    "BgeM3FDEModel": ("bge_m3_fde", "BgeM3FDE"),
+    "DeciLMForCausalLM": ("nemotron_nas", "DeciLMForCausalLM"),
+    "Gemma2Model": ("gemma2", "Gemma2ForCausalLM"),
+    "GlmForCausalLM": ("glm", "GlmForCausalLM"),
+    "GritLM": ("gritlm", "GritLM"),
+    "GteModel": ("bert", "GteEmbeddingModel"),
+    "InternLM2ForRewardModel": ("internlm2", "InternLM2ForRewardModel"),
+    "JambaForSequenceClassification": ("jamba", "JambaForSequenceClassification"),  # noqa: E501
+    "LlamaModel": ("llama", "LlamaForCausalLM"),
+    **{
+        # Multiple models share the same architecture, so we include them all
+        k: (mod, arch) for k, (mod, arch) in _TEXT_GENERATION_MODELS.items()
+        if arch == "LlamaForCausalLM"
+    },
+    "MistralModel": ("llama", "LlamaForCausalLM"),
+    "NomicBertModel": ("bert", "NomicBertEmbeddingModel"),
+    "Phi3ForCausalLM": ("phi3", "Phi3ForCausalLM"),
+    "Qwen2Model": ("qwen2", "Qwen2EmbeddingModel"),
+    "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
+    "Qwen2ForRewardModel": ("qwen2_rm", "Qwen2ForRewardModel"),
+    "Qwen2ForProcessRewardModel": ("qwen2_rm", "Qwen2ForProcessRewardModel"),
+    "RobertaForMaskedLM": ("roberta", "RobertaEmbeddingModel"),
+    "RobertaModel": ("roberta", "RobertaEmbeddingModel"),
+    "TeleChat2ForCausalLM": ("telechat2", "TeleChat2ForCausalLM"),
+    "XLMRobertaModel": ("roberta", "RobertaEmbeddingModel"),
+    # [Multimodal]
+    "LlavaNextForConditionalGeneration": ("llava_next", "LlavaNextForConditionalGeneration"),  # noqa: E501
+    "Phi3VForCausalLM": ("phi3v", "Phi3VForCausalLM"),
+    "Qwen2VLForConditionalGeneration": ("qwen2_vl", "Qwen2VLForConditionalGeneration"),  # noqa: E501
+    # [Auto-converted (see adapters.py)]
+    "Qwen2ForSequenceClassification": ("qwen2", "Qwen2ForCausalLM"),
+    # Technically PrithviGeoSpatialMAE is a model that works on images, both in
+    # input and output. I am adding it here because it piggy-backs on embedding
+    # models for the time being.
+    "PrithviGeoSpatialMAE": ("prithvi_geospatial_mae", "PrithviGeoSpatialMAE"),
+}
+
+_CROSS_ENCODER_MODELS = {
+    "BertForSequenceClassification": ("bert", "BertForSequenceClassification"),
+    "RobertaForSequenceClassification": ("roberta",
+                                         "RobertaForSequenceClassification"),
+    "XLMRobertaForSequenceClassification": ("roberta",
+                                            "RobertaForSequenceClassification"),
+    "ModernBertForSequenceClassification": ("modernbert",
+                                            "ModernBertForSequenceClassification"),
+}
+
+_MULTIMODAL_MODELS = {
+    # [Decoder-only]
+    "AriaForConditionalGeneration": ("aria", "AriaForConditionalGeneration"),
+    "AyaVisionForConditionalGeneration": ("aya_vision", "AyaVisionForConditionalGeneration"),  # noqa: E501
+    "Blip2ForConditionalGeneration": ("blip2", "Blip2ForConditionalGeneration"),
+    "ChameleonForConditionalGeneration": ("chameleon", "ChameleonForConditionalGeneration"),  # noqa: E501
+    "DeepseekVLV2ForCausalLM": ("deepseek_vl2", "DeepseekVLV2ForCausalLM"),
+    "FuyuForCausalLM": ("fuyu", "FuyuForCausalLM"),
+    "Gemma3ForConditionalGeneration": ("gemma3_mm", "Gemma3ForConditionalGeneration"),  # noqa: E501
+    "GLM4VForCausalLM": ("glm4v", "GLM4VForCausalLM"),
+    "GraniteSpeechForConditionalGeneration": ("granite_speech", "GraniteSpeechForConditionalGeneration"),  # noqa: E501
+    "H2OVLChatModel": ("h2ovl", "H2OVLChatModel"),
+    "InternVLChatModel": ("internvl", "InternVLChatModel"),
+    "Idefics3ForConditionalGeneration":("idefics3","Idefics3ForConditionalGeneration"),
+    "SmolVLMForConditionalGeneration": ("smolvlm","SmolVLMForConditionalGeneration"),  # noqa: E501
+    "KimiVLForConditionalGeneration": ("kimi_vl", "KimiVLForConditionalGeneration"),  # noqa: E501
+    "LlavaForConditionalGeneration": ("llava", "LlavaForConditionalGeneration"),
+    "LlavaNextForConditionalGeneration": ("llava_next", "LlavaNextForConditionalGeneration"),  # noqa: E501
+    "LlavaNextVideoForConditionalGeneration": ("llava_next_video", "LlavaNextVideoForConditionalGeneration"),  # noqa: E501
+    "LlavaOnevisionForConditionalGeneration": ("llava_onevision", "LlavaOnevisionForConditionalGeneration"),  # noqa: E501
+    "MantisForConditionalGeneration": ("llava", "MantisForConditionalGeneration"),  # noqa: E501
+    "MiniCPMO": ("minicpmo", "MiniCPMO"),
+    "MiniCPMV": ("minicpmv", "MiniCPMV"),
+    "Mistral3ForConditionalGeneration": ("mistral3", "Mistral3ForConditionalGeneration"),  # noqa: E501
+    "MolmoForCausalLM": ("molmo", "MolmoForCausalLM"),
+    "NVLM_D": ("nvlm_d", "NVLM_D_Model"),
+    "PaliGemmaForConditionalGeneration": ("paligemma", "PaliGemmaForConditionalGeneration"),  # noqa: E501
+    "Phi3VForCausalLM": ("phi3v", "Phi3VForCausalLM"),
+    "PixtralForConditionalGeneration": ("pixtral", "PixtralForConditionalGeneration"),  # noqa: E501
+    "QwenVLForConditionalGeneration": ("qwen_vl", "QwenVLForConditionalGeneration"),  # noqa: E501
+    "Qwen2VLForConditionalGeneration": ("qwen2_vl", "Qwen2VLForConditionalGeneration"),  # noqa: E501
+    "Qwen2_5_VLForConditionalGeneration": ("qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),  # noqa: E501
+    "Qwen2AudioForConditionalGeneration": ("qwen2_audio", "Qwen2AudioForConditionalGeneration"),  # noqa: E501
+    "Qwen2_5OmniModel": ("qwen2_5_omni_thinker", "Qwen2_5OmniThinkerForConditionalGeneration"),  # noqa: E501
+    "UltravoxModel": ("ultravox", "UltravoxModel"),
+    "Phi4MMForCausalLM": ("phi4mm", "Phi4MMForCausalLM"),
+    # [Encoder-decoder]
+    "Florence2ForConditionalGeneration": ("florence2", "Florence2ForConditionalGeneration"),  # noqa: E501
+    "MllamaForConditionalGeneration": ("mllama", "MllamaForConditionalGeneration"),  # noqa: E501
+    "Llama4ForConditionalGeneration": ("mllama4", "Llama4ForConditionalGeneration"),  # noqa: E501
+    "SkyworkR1VChatModel": ("skyworkr1v", "SkyworkR1VChatModel"),
+    "WhisperForConditionalGeneration": ("whisper", "WhisperForConditionalGeneration"),  # noqa: E501
+}
+
+_SPECULATIVE_DECODING_MODELS = {
+    "EAGLEModel": ("eagle", "EAGLE"),
+    "EagleLlamaForCausalLM": ("llama_eagle", "EagleLlamaForCausalLM"),
+    "Eagle3LlamaForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
+    "DeepSeekMTPModel": ("deepseek_mtp", "DeepSeekMTP"),
+    "MedusaModel": ("medusa", "Medusa"),
+    "MLPSpeculatorPreTrainedModel": ("mlp_speculator", "MLPSpeculator"),
+}
+
+_TRANSFORMERS_MODELS = {
+    "TransformersForCausalLM": ("transformers", "TransformersForCausalLM"),
+}
+# yapf: enable
+
+_VLLM_MODELS = {
+    **_TEXT_GENERATION_MODELS,
+    **_EMBEDDING_MODELS,
+    **_CROSS_ENCODER_MODELS,
+    **_MULTIMODAL_MODELS,
+    **_SPECULATIVE_DECODING_MODELS,
+    **_TRANSFORMERS_MODELS,
+}
+
+# This variable is used as the args for subprocess.run(). We
+# can modify  this variable to alter the args if needed. e.g.
+# when we use par format to pack things together, sys.executable
+# might not be the target we want to run.
+_SUBPROCESS_COMMAND = [
+    sys.executable, "-m", "vllm.model_executor.models.registry"
+]
+
+
+@dataclass(frozen=True)
+class _ModelInfo:
+    architecture: str
+    is_text_generation_model: bool
+    is_pooling_model: bool
+    supports_cross_encoding: bool
+    supports_multimodal: bool
+    supports_pp: bool
+    has_inner_state: bool
+    is_attention_free: bool
+    is_hybrid: bool
+    has_noops: bool
+    supports_transcription: bool
+    supports_v0_only: bool
+
+    @staticmethod
+    def from_model_cls(model: Type[nn.Module]) -> "_ModelInfo":
+        return _ModelInfo(
+            architecture=model.__name__,
+            is_text_generation_model=is_text_generation_model(model),
+            is_pooling_model=True,  # Can convert any model into a pooling model
+            supports_cross_encoding=supports_cross_encoding(model),
+            supports_multimodal=supports_multimodal(model),
+            supports_pp=supports_pp(model),
+            has_inner_state=has_inner_state(model),
+            is_attention_free=is_attention_free(model),
+            is_hybrid=is_hybrid(model),
+            supports_transcription=supports_transcription(model),
+            supports_v0_only=supports_v0_only(model),
+            has_noops=has_noops(model),
+        )
+
+
+class _BaseRegisteredModel(ABC):
+
+    @abstractmethod
+    def inspect_model_cls(self) -> _ModelInfo:
+        raise NotImplementedError
+
+    @abstractmethod
+    def load_model_cls(self) -> Type[nn.Module]:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class _RegisteredModel(_BaseRegisteredModel):
+    """
+    Represents a model that has already been imported in the main process.
+    """
+
+    interfaces: _ModelInfo
+    model_cls: Type[nn.Module]
+
+    @staticmethod
+    def from_model_cls(model_cls: Type[nn.Module]):
+        return _RegisteredModel(
+            interfaces=_ModelInfo.from_model_cls(model_cls),
+            model_cls=model_cls,
+        )
+
+    def inspect_model_cls(self) -> _ModelInfo:
+        return self.interfaces
+
+    def load_model_cls(self) -> Type[nn.Module]:
+        return self.model_cls
+
+
+@dataclass(frozen=True)
+class _LazyRegisteredModel(_BaseRegisteredModel):
+    """
+    Represents a model that has not been imported in the main process.
+    """
+    module_name: str
+    class_name: str
+
+    # Performed in another process to avoid initializing CUDA
+    def inspect_model_cls(self) -> _ModelInfo:
+        return _run_in_subprocess(
+            lambda: _ModelInfo.from_model_cls(self.load_model_cls()))
+
+    def load_model_cls(self) -> Type[nn.Module]:
+        mod = importlib.import_module(self.module_name)
+        return getattr(mod, self.class_name)
+
+
+@lru_cache(maxsize=128)
+def _try_load_model_cls(
+    model_arch: str,
+    model: _BaseRegisteredModel,
+) -> Optional[Type[nn.Module]]:
+    from vllm.platforms import current_platform
+    current_platform.verify_model_arch(model_arch)
+    try:
+        return model.load_model_cls()
+    except Exception:
+        logger.exception("Error in loading model architecture '%s'",
+                         model_arch)
+        return None
+
+
+@lru_cache(maxsize=128)
+def _try_inspect_model_cls(
+    model_arch: str,
+    model: _BaseRegisteredModel,
+) -> Optional[_ModelInfo]:
+    try:
+        return model.inspect_model_cls()
+    except Exception:
+        logger.exception("Error in inspecting model architecture '%s'",
+                         model_arch)
+        return None
+
+
+@dataclass
+class _ModelRegistry:
+    # Keyed by model_arch
+    models: Dict[str, _BaseRegisteredModel] = field(default_factory=dict)
+
+    def get_supported_archs(self) -> AbstractSet[str]:
+        return self.models.keys()
+
+    def register_model(
+        self,
+        model_arch: str,
+        model_cls: Union[Type[nn.Module], str],
+    ) -> None:
+        """
+        Register an external model to be used in vLLM.
+
+        :code:`model_cls` can be either:
+
+        - A :class:`torch.nn.Module` class directly referencing the model.
+        - A string in the format :code:`<module>:<class>` which can be used to
+          lazily import the model. This is useful to avoid initializing CUDA
+          when importing the model and thus the related error
+          :code:`RuntimeError: Cannot re-initialize CUDA in forked subprocess`.
+        """
+        if not isinstance(model_arch, str):
+            msg = f"`model_arch` should be a string, not a {type(model_arch)}"
+            raise TypeError(msg)
+
+        if model_arch in self.models:
+            logger.warning(
+                "Model architecture %s is already registered, and will be "
+                "overwritten by the new model class %s.", model_arch,
+                model_cls)
+
+        if isinstance(model_cls, str):
+            split_str = model_cls.split(":")
+            if len(split_str) != 2:
+                msg = "Expected a string in the format `<module>:<class>`"
+                raise ValueError(msg)
+
+            model = _LazyRegisteredModel(*split_str)
+        elif isinstance(model_cls, type) and (is_in_doc_build() or issubclass(
+                model_cls, nn.Module)):
+            model = _RegisteredModel.from_model_cls(model_cls)
+        else:
+            msg = ("`model_cls` should be a string or PyTorch model class, "
+                   f"not a {type(model_arch)}")
+            raise TypeError(msg)
+
+        self.models[model_arch] = model
+
+    def _raise_for_unsupported(self, architectures: List[str]):
+        all_supported_archs = self.get_supported_archs()
+
+        if any(arch in all_supported_archs for arch in architectures):
+            raise ValueError(
+                f"Model architectures {architectures} failed "
+                "to be inspected. Please check the logs for more details.")
+
+        raise ValueError(
+            f"Model architectures {architectures} are not supported for now. "
+            f"Supported architectures: {all_supported_archs}")
+
+    def _try_load_model_cls(self,
+                            model_arch: str) -> Optional[Type[nn.Module]]:
+        if model_arch not in self.models:
+            return None
+
+        return _try_load_model_cls(model_arch, self.models[model_arch])
+
+    def _try_inspect_model_cls(self, model_arch: str) -> Optional[_ModelInfo]:
+        if model_arch not in self.models:
+            return None
+
+        return _try_inspect_model_cls(model_arch, self.models[model_arch])
+
+    def _normalize_archs(
+        self,
+        architectures: Union[str, List[str]],
+    ) -> List[str]:
+        if isinstance(architectures, str):
+            architectures = [architectures]
+        if not architectures:
+            logger.warning("No model architectures are specified")
+
+        # filter out support architectures
+        normalized_arch = list(
+            filter(lambda model: model in self.models, architectures))
+
+        # make sure Transformers backend is put at the last as a fallback
+        if len(normalized_arch) != len(architectures):
+            normalized_arch.append("TransformersForCausalLM")
+        return normalized_arch
+
+    def inspect_model_cls(
+        self,
+        architectures: Union[str, List[str]],
+    ) -> Tuple[_ModelInfo, str]:
+        architectures = self._normalize_archs(architectures)
+
+        for arch in architectures:
+            model_info = self._try_inspect_model_cls(arch)
+            if model_info is not None:
+                return (model_info, arch)
+
+        return self._raise_for_unsupported(architectures)
+
+    def resolve_model_cls(
+        self,
+        architectures: Union[str, List[str]],
+    ) -> Tuple[Type[nn.Module], str]:
+        architectures = self._normalize_archs(architectures)
+
+        for arch in architectures:
+            model_cls = self._try_load_model_cls(arch)
+            if model_cls is not None:
+                return (model_cls, arch)
+
+        return self._raise_for_unsupported(architectures)
+
+    def is_text_generation_model(
+        self,
+        architectures: Union[str, List[str]],
+    ) -> bool:
+        model_cls, _ = self.inspect_model_cls(architectures)
+        return model_cls.is_text_generation_model
+
+    def is_pooling_model(
+        self,
+        architectures: Union[str, List[str]],
+    ) -> bool:
+        model_cls, _ = self.inspect_model_cls(architectures)
+        return model_cls.is_pooling_model
+
+    def is_cross_encoder_model(
+        self,
+        architectures: Union[str, List[str]],
+    ) -> bool:
+        model_cls, _ = self.inspect_model_cls(architectures)
+        return model_cls.supports_cross_encoding
+
+    def is_multimodal_model(
+        self,
+        architectures: Union[str, List[str]],
+    ) -> bool:
+        model_cls, _ = self.inspect_model_cls(architectures)
+        return model_cls.supports_multimodal
+
+    def is_pp_supported_model(
+        self,
+        architectures: Union[str, List[str]],
+    ) -> bool:
+        model_cls, _ = self.inspect_model_cls(architectures)
+        return model_cls.supports_pp
+
+    def model_has_inner_state(
+        self,
+        architectures: Union[str, List[str]],
+    ) -> bool:
+        model_cls, _ = self.inspect_model_cls(architectures)
+        return model_cls.has_inner_state
+
+    def is_attention_free_model(
+        self,
+        architectures: Union[str, List[str]],
+    ) -> bool:
+        model_cls, _ = self.inspect_model_cls(architectures)
+        return model_cls.is_attention_free
+
+    def is_hybrid_model(
+        self,
+        architectures: Union[str, List[str]],
+    ) -> bool:
+        model_cls, _ = self.inspect_model_cls(architectures)
+        return model_cls.is_hybrid
+
+    def is_noops_model(
+        self,
+        architectures: Union[str, List[str]],
+    ) -> bool:
+        model_cls, _ = self.inspect_model_cls(architectures)
+        return model_cls.has_noops
+
+    def is_transcription_model(
+        self,
+        architectures: Union[str, List[str]],
+    ) -> bool:
+        model_cls, _ = self.inspect_model_cls(architectures)
+        return model_cls.supports_transcription
+
+    def is_v1_compatible(
+        self,
+        architectures: Union[str, List[str]],
+    ) -> bool:
+        model_cls, _ = self.inspect_model_cls(architectures)
+        return not model_cls.supports_v0_only
+
+
+ModelRegistry = _ModelRegistry({
+    model_arch:
+    _LazyRegisteredModel(
+        module_name=f"vllm.model_executor.models.{mod_relname}",
+        class_name=cls_name,
+    )
+    for model_arch, (mod_relname, cls_name) in _VLLM_MODELS.items()
+})
+
+_T = TypeVar("_T")
+
+
+def _run_in_subprocess(fn: Callable[[], _T]) -> _T:
+    # NOTE: We use a temporary directory instead of a temporary file to avoid
+    # issues like https://stackoverflow.com/questions/23212435/permission-denied-to-write-to-my-temporary-file
+    with tempfile.TemporaryDirectory() as tempdir:
+        output_filepath = os.path.join(tempdir, "registry_output.tmp")
+
+        # `cloudpickle` allows pickling lambda functions directly
+        input_bytes = cloudpickle.dumps((fn, output_filepath))
+
+        # cannot use `sys.executable __file__` here because the script
+        # contains relative imports
+        returned = subprocess.run(_SUBPROCESS_COMMAND,
+                                  input=input_bytes,
+                                  capture_output=True)
+
+        # check if the subprocess is successful
+        try:
+            returned.check_returncode()
+        except Exception as e:
+            # wrap raised exception to provide more information
+            raise RuntimeError(f"Error raised in subprocess:\n"
+                               f"{returned.stderr.decode()}") from e
+
+        with open(output_filepath, "rb") as f:
+            return pickle.load(f)
+
+
+def _run() -> None:
+    # Setup plugins
+    from vllm.plugins import load_general_plugins
+    load_general_plugins()
+
+    fn, output_file = pickle.loads(sys.stdin.buffer.read())
+
+    result = fn()
+
+    with open(output_file, "wb") as f:
+        f.write(pickle.dumps(result))
+
+
+if __name__ == "__main__":
+    _run()
+
+--- END OF FILE: vllm/model_executor/models/registry.py ---
+
+--- START OF FILE: vllm/model_executor/models/test_fde.py ---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import sys
+from dataclasses import dataclass
+from unittest.mock import MagicMock
+
+import torch
+
+# Mock dependencies
+sys.modules["psutil"] = MagicMock()
+sys.modules["zmq"] = MagicMock()
+sys.modules["zmq.asyncio"] = MagicMock()
+sys.modules["cbor2"] = MagicMock()
+
+
+# Mock PoolingMetadata
+@dataclass
+class MockPoolingMetadata:
+    prompt_lens: torch.Tensor
+
+
+# Import FDE components
+from vllm.model_executor.layers.fde import FDEConfig, FDEPooler
+
+
+def test_fde_pooler_shapes():
+    d = 128
+    config = FDEConfig(
+        ksim=4,  # B=16
+        d_proj=8,
+        R_reps=2,
+        d_final=None,
+        fill_empty_clusters=True,
+        seed=42,
+    )
+
+    pooler = FDEPooler(d=d, config=config)
+
+    # Simulate 2 requests
+    # Req 1: 10 tokens
+    # Req 2: 5 tokens
+    # Total tokens: 15
+    prompt_lens = torch.tensor([10, 5], dtype=torch.int32)
+    pooling_metadata = MockPoolingMetadata(prompt_lens=prompt_lens)
+
+    hidden_states = torch.randn(15, d)
+
+    output = pooler(hidden_states, pooling_metadata)
+
+    # Expected output shape: (NumRequests, R * B * d_block)
+    # NumRequests=2, R=2, B=16, d_block=8 -> 256
+    expected_dim = 2 * 16 * 8
+    assert output.shape == (2, expected_dim)
+    assert not torch.isnan(output).any()
+    print("test_fde_pooler_shapes passed")
+
+
+def test_fde_pooler_final_proj():
+    d = 128
+    d_final = 64
+    config = FDEConfig(
+        ksim=4, d_proj=8, R_reps=2, d_final=d_final, fill_empty_clusters=True
+    )
+
+    pooler = FDEPooler(d=d, config=config)
+
+    prompt_lens = torch.tensor([10], dtype=torch.int32)
+    pooling_metadata = MockPoolingMetadata(prompt_lens=prompt_lens)
+
+    hidden_states = torch.randn(10, d)
+    output = pooler(hidden_states, pooling_metadata)
+
+    assert output.shape == (1, d_final)
+    print("test_fde_pooler_final_proj passed")
+
+
+if __name__ == "__main__":
+    test_fde_pooler_shapes()
+    test_fde_pooler_final_proj()
+
+--- END OF FILE: vllm/model_executor/models/test_fde.py ---
+
+--- START OF FILE: vllm/pooling_params.py ---
+# SPDX-License-Identifier: Apache-2.0
+
+from typing import TYPE_CHECKING, Any, Optional
+
+import msgspec
+
+if TYPE_CHECKING:
+    from vllm.config import ModelConfig
+
+
+class PoolingParams(
+        msgspec.Struct,
+        omit_defaults=True,  # type: ignore[call-arg]
+        array_like=True):  # type: ignore[call-arg]
+    """API parameters for pooling models.
+
+    Attributes:
+        dimensions: Reduce the dimensions of embeddings
+                    if model support matryoshka representation.
+        additional_data: Any additional data needed for pooling.
+        is_document: Whether this is a document embedding (for FDE pooler).
+        normalize: Whether to L2 normalize the output embeddings.
+    """
+
+    dimensions: Optional[int] = None
+    additional_data: Optional[Any] = None
+    is_document: bool = False
+    normalize: bool = False
+
+    def clone(self) -> "PoolingParams":
+        """Returns a deep copy of the PoolingParams instance."""
+        return PoolingParams(dimensions=self.dimensions,
+                             additional_data=self.additional_data,
+                             is_document=self.is_document,
+                             normalize=self.normalize)
+
+    def verify(self, model_config: "ModelConfig") -> None:
+        if self.dimensions is not None:
+            if not model_config.is_matryoshka:
+                raise ValueError(
+                    f'Model "{model_config.served_model_name}" does not '
+                    f'support matryoshka representation, '
+                    f'changing output dimensions will lead to poor results.')
+
+            mds = model_config.matryoshka_dimensions
+            if mds is not None:
+                if self.dimensions not in mds:
+                    raise ValueError(
+                        f'Model "{model_config.served_model_name}" '
+                        f'only supports {str(mds)} matryoshka dimensions, '
+                        f'use other output dimensions will '
+                        f'lead to poor results.')
+            elif self.dimensions < 1:
+                raise ValueError("Dimensions must be greater than 0")
+
+    def __repr__(self) -> str:
+        return (f"PoolingParams("
+                f"dimensions={self.dimensions}, "
+                f"is_document={self.is_document}, "
+                f"normalize={self.normalize}, "
+                f"additional_metadata={self.additional_data})")
+
+--- END OF FILE: vllm/pooling_params.py ---
+
+--- START OF FILE: vllm/rag_middleware.py ---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import argparse
+from typing import Any
+
+import numpy as np
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.async_llm_engine import AsyncLLMEngine
+from vllm.pooling_params import PoolingParams
+
+
+# --- Mock ANN Index (Replace with Faiss/DiskANN) ---
+class MockANNIndex:
+    def __init__(self, dim: int):
+        self.dim = dim
+        self.vectors: list[np.ndarray] = []
+        self.metadata: list[dict[str, Any]] = []
+
+    def add(self, vector: np.ndarray, meta: dict[str, Any]):
+        if vector.shape[0] != self.dim:
+            raise ValueError(f"Vector dim {vector.shape[0]} != index dim {self.dim}")
+        self.vectors.append(vector)
+        self.metadata.append(meta)
+
+    def search(self, query: np.ndarray, k: int = 5) -> list[dict[str, Any]]:
+        if not self.vectors:
+            return []
+
+        # Simple cosine similarity
+        # query: (d,)
+        # db: (N, d)
+        db = np.stack(self.vectors)
+
+        # Normalize
+        q_norm = query / (np.linalg.norm(query) + 1e-9)
+        db_norm = db / (np.linalg.norm(db, axis=1, keepdims=True) + 1e-9)
+
+        scores = np.dot(db_norm, q_norm)
+
+        # Top-k
+        top_k_indices = np.argsort(scores)[::-1][:k]
+
+        results = []
+        for idx in top_k_indices:
+            results.append(
+                {"score": float(scores[idx]), "metadata": self.metadata[idx]}
+            )
+        return results
+
+
+# --- FastAPI App ---
+app = FastAPI(title="vLLM FDE RAG Middleware")
+
+
+class AppState:
+    engine: AsyncLLMEngine | None = None
+    ann_index: MockANNIndex | None = None
+
+
+state = AppState()
+
+
+class QueryRequest(BaseModel):
+    query: str
+    k: int = 5
+    mode: str = "query"
+
+
+class IndexRequest(BaseModel):
+    text: str
+    metadata: dict[str, Any] = {}
+    mode: str = "doc"
+
+
+@app.on_event("startup")
+async def startup_event():
+    # Initialize vLLM Engine
+    # Note: In production, pass args via command line or config
+    parser = argparse.ArgumentParser()
+    AsyncEngineArgs.add_cli_args(parser)
+    args = parser.parse_args()
+
+    # Force embedding mode if not set (though model type should handle it)
+    # args.model = "BAAI/bge-m3" # Example, user should pass this
+
+    engine_args = AsyncEngineArgs.from_cli_args(args)
+    state.engine = AsyncLLMEngine.from_engine_args(engine_args)
+
+    # Initialize ANN Index (dim depends on FDE config, e.g., 1024)
+    # We might need to get this from model config after load,
+    # but for now assume we know it or lazy init.
+    # Let's lazy init on first embedding if needed, or hardcode for demo.
+    state.ann_index = MockANNIndex(dim=1024)  # Default BGE-M3 FDE dim?
+
+    print("vLLM Engine and ANN Index initialized.")
+
+
+async def get_embedding(text: str, mode: str = "query") -> np.ndarray:
+    """Generate FDE embedding using vLLM."""
+    if state.engine is None:
+        raise RuntimeError("Engine not initialized")
+
+    # Create a unique request ID
+    request_id = f"req_{hash(text)}_{mode}"
+
+    # Pooling params
+    is_doc = mode == "doc"
+    pooling_params = PoolingParams(is_document=is_doc)
+
+    # Generate
+    # vLLM's encode() returns an AsyncGenerator
+    results_generator = state.engine.encode(
+        request_id=request_id, prompt=text, pooling_params=pooling_params
+    )
+
+    # Get final result
+    final_output = None
+    async for request_output in results_generator:
+        final_output = request_output
+
+    # Extract vector
+    # PoolerOutput is typically a list of floats or list of list of floats
+    # FDE returns a single vector per prompt
+    if final_output.outputs:
+        # data is PoolingOutput
+        # embedding is in outputs[0].embedding
+        embedding = final_output.outputs[0].embedding
+        return np.array(embedding, dtype=np.float32)
+    else:
+        raise RuntimeError("No embedding returned")
+
+
+@app.post("/query")
+async def query_endpoint(req: QueryRequest):
+    """
+    1. Embed query using vLLM FDE.
+    2. Search ANN index.
+    3. Return ranked results.
+    """
+    try:
+        # 1. Embed
+        embedding = await get_embedding(req.query, mode=req.mode)
+
+        # 2. Search
+        # Check dim
+        if state.ann_index.dim != embedding.shape[0]:
+            # Re-init index if dim mismatch (lazy fix for demo)
+            print(f"Resizing index from {state.ann_index.dim} to {embedding.shape[0]}")
+            state.ann_index = MockANNIndex(dim=embedding.shape[0])
+
+        results = state.ann_index.search(embedding, k=req.k)
+
+        return {"query": req.query, "results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/index")
+async def index_endpoint(req: IndexRequest):
+    """
+    1. Embed text using vLLM FDE.
+    2. Add to ANN index.
+    """
+    try:
+        embedding = await get_embedding(req.text, mode=req.mode)
+
+        # Check dim
+        if state.ann_index.dim != embedding.shape[0]:
+            print(f"Resizing index from {state.ann_index.dim} to {embedding.shape[0]}")
+            state.ann_index = MockANNIndex(dim=embedding.shape[0])
+
+        idx = len(state.ann_index.vectors)
+        state.ann_index.add(embedding, req.metadata)
+
+        return {"id": idx, "status": "indexed"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "engine_ready": state.engine is not None,
+        "index_size": len(state.ann_index.vectors) if state.ann_index else 0,
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # Example usage:
+    # python rag_middleware.py --model /path/to/bge-m3-fde --trust-remote-code
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+--- END OF FILE: vllm/rag_middleware.py ---
+
+--- START OF FILE: vllm/standalone_test_fde.py ---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import sys
+from dataclasses import dataclass
+from unittest.mock import MagicMock
+
+import torch
+import torch.nn as nn
+
+# 1. Mock vllm modules BEFORE importing fde
+vllm_mock = MagicMock()
+sys.modules["vllm"] = vllm_mock
+sys.modules["vllm.model_executor"] = MagicMock()
+sys.modules["vllm.model_executor.layers"] = MagicMock()
+
+
+# Define Pooler class for inheritance
+class MockPooler(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+
+# Mock pooler module
+pooler_module = MagicMock()
+pooler_module.Pooler = MockPooler
+pooler_module.PoolingParamsUpdate = MagicMock
+sys.modules["vllm.model_executor.layers.pooler"] = pooler_module
+
+# Mock metadata module
+metadata_module = MagicMock()
+
+
+@dataclass
+
+class MockPoolingMetadata:
+    prompt_lens: torch.Tensor
+    pooling_params: list = None
+
+
+metadata_module.PoolingMetadata = MockPoolingMetadata
+sys.modules["vllm.v1.pool.metadata"] = metadata_module
+
+# Mock tasks module
+tasks_module = MagicMock()
+tasks_module.PoolingTask = MagicMock
+sys.modules["vllm.tasks"] = tasks_module
+
+# Now we can import FDEPooler
+# We need to make sure we import from the file, but since we are running this script,
+# we can assume fde.py is in the path or we load it manually.
+# Since we are in vllm root, we can import from vllm.model_executor.layers.fde
+# BUT, we mocked vllm! So importing vllm.model_executor.layers.fde will return the mock!
+# We need to bypass the mock for OUR file.
+
+# Strategy: Read the file content and exec it?
+# Or, simpler: Don't mock "vllm" top level, but mock the submodules we don't have.
+# But "vllm" package might not be importable if dependencies are missing.
+
+# Let's try to load the module from source file directly.
+import importlib.util
+
+file_path = "model_executor/layers/fde.py"
+spec = importlib.util.spec_from_file_location(
+    "vllm.model_executor.layers.fde", file_path
+)
+fde_module = importlib.util.module_from_spec(spec)
+# We need to populate sys.modules so that relative imports or internal imports work?
+# fde.py imports:
+# from vllm.model_executor.layers.pooler import Pooler, PoolingParamsUpdate
+# from vllm.v1.pool.metadata import PoolingMetadata
+# from vllm.tasks import PoolingTask
+
+# These are already mocked in sys.modules.
+sys.modules["vllm.model_executor.layers.fde"] = fde_module
+spec.loader.exec_module(fde_module)
+
+FDEPooler = fde_module.FDEPooler
+FDEConfig = fde_module.FDEConfig
+
+
+
+@dataclass
+class FDEParams:
+    G: torch.Tensor           # (R, d, ksim)
+    S: torch.Tensor | None    # (R, d_proj, d)
+    W: torch.Tensor | None    # (d_final, d_FDE) or None
+    fill_empty_clusters: bool = False
+
+    @property
+    def R(self):
+        return self.G.shape[0]
+
+    @property
+    def d(self):
+        return self.G.shape[1]
+
+    @property
+    def ksim(self):
+        return self.G.shape[2]
+
+    @property
+    def B(self):
+        return 1 << self.ksim
+
+    def to(self, device, dtype=None):
+        self.G = self.G.to(device=device, dtype=dtype or self.G.dtype)
+        if self.S is not None:
+            self.S = self.S.to(device=device, dtype=dtype or self.S.dtype)
+        if self.W is not None:
+            self.W = self.W.to(device=device, dtype=dtype or self.W.dtype)
+        return self
+
+
+def _fill_empty_doc_buckets_hcube_single(
+    centroids: torch.Tensor,  # (R, B, d)
+    counts: torch.Tensor,     # (R, B)
+    ksim: int,
+) -> torch.Tensor:
+    R, B, d = centroids.shape
+    device = centroids.device
+    masks = 1 << torch.arange(ksim, device=device, dtype=torch.long)
+
+    for r in range(R):
+        present = counts[r] > 0        # (B,)
+        if present.all():
+            continue
+        empty_mask = ~present
+        empty_idx = torch.nonzero(empty_mask, as_tuple=False).squeeze(-1)
+        if empty_idx.numel() == 0:
+            continue
+        for b in empty_idx.tolist():
+            b_val = int(b)
+            # radius 1
+            n1 = (b_val ^ masks).clamp_(0, B - 1)
+            cand = n1[present[n1]]
+            if cand.numel() > 0:
+                centroids[r, b] = centroids[r, int(cand[0])]
+                continue
+            # radius 2
+            found = False
+            for i in range(ksim):
+                if found:
+                    break
+                mi = int(masks[i])
+                for j in range(i + 1, ksim):
+                    nb = b_val ^ mi ^ int(masks[j])
+                    if 0 <= nb < B and present[nb]:
+                        centroids[r, b] = centroids[r, nb]
+                        found = True
+                        break
+    return centroids
+
+
+@torch.no_grad()
+def encode_to_fde(
+    tokens: torch.Tensor,   # (T, d)
+    params: FDEParams,
+    mode: str = "query",    # "query" or "doc"
+) -> torch.Tensor:
+    """
+    FDEPooler와 완전히 동일한 파이프라인 (N=1인 경우).
+    Returns:
+      - params.W is None: (R * B * d_block,)
+      - else: (d_final,)
+    """
+    assert mode in ("query", "doc")
+    T, d = tokens.shape
+    assert d == params.d, f"tokens.shape[1]={d}, expected {params.d}"
+
+    device = tokens.device
+    dtype  = tokens.dtype
+
+    R    = params.R
+    ksim = params.ksim
+    B    = params.B
+
+    G = params.G.to(device=device, dtype=dtype)      # (R, d, ksim)
+    S = params.S.to(device=device, dtype=dtype) if params.S is not None else None
+    W = params.W.to(device=device, dtype=dtype) if params.W is not None else None
+
+    # 1) 토큰 L2 normalize (Pooler의 _normalize_rows와 동일)
+    X = torch.nn.functional.normalize(tokens, p=2, dim=-1, eps=1e-6)   # (T, d)
+
+    # 2) SimHash bucket ids: (T, R)
+    logits = torch.einsum("td,Rdk->tRk", X, G)       # (T, R, ksim)
+    bits   = (logits > 0).to(torch.int64)
+    powers = 1 << torch.arange(ksim, device=device, dtype=torch.int64)
+    bids   = (bits * powers).sum(dim=-1)             # (T, R), in [0, B-1]
+
+    # 3) per-(R,B) bucket 합, 카운트 (Pooler의 index_add와 동일한 모양)
+    sums   = torch.zeros(R * B, d, device=device, dtype=dtype)
+    counts = torch.zeros(R * B,    device=device, dtype=dtype)
+
+    rep_ids   = torch.arange(R, device=device).unsqueeze(0).expand(T, -1)   # (T, R)
+    flat_idx  = (rep_ids * B + bids).reshape(-1)                            # (T*R,)
+
+    X_expanded = X.unsqueeze(1).expand(-1, R, -1).reshape(-1, d)            # (T*R, d)
+    sums.index_add_(0, flat_idx, X_expanded)
+    counts.index_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=dtype))
+
+    sums   = sums.view(R, B, d)        # (R, B, d)
+    counts = counts.view(R, B)         # (R, B)
+
+    # 4) query: sum, doc: mean (+ optional fill)
+    if mode == "doc":
+        counts_safe = counts.clamp_min(1.0)[..., None]
+        centroids = sums / counts_safe   # (R,B,d)
+        if params.fill_empty_clusters:
+            centroids = _fill_empty_doc_buckets_hcube_single(
+                centroids, counts, ksim
+            )
+        blocks_in = centroids
+    else:
+        blocks_in = sums                                       # (R,B,d)
+
+    # 5) 버킷 단위 L2 normalize (Pooler와 동일)
+    blocks_in = torch.nn.functional.normalize(blocks_in, p=2, dim=-1, eps=1e-6)  # (R,B,d)
+
+    # 6) inner projection ψ: (R,B,d) x (R,d_proj,d) -> (R,B,d_proj)
+    if S is not None:
+        blocks = torch.einsum("RBd,Rpd->RBp", blocks_in, S)    # (R,B,d_proj)
+    else:
+        blocks = blocks_in                                     # (R,B,d)
+
+    # 7) flatten: (R,B,*) → (R*B*dim,)
+    flat = blocks.reshape(-1)                                  # (d_FDE,)
+
+    # 8) final projection ψ′ (optional)
+    if W is not None:
+        flat = W @ flat                                        # (d_final,)
+
+    return flat
+
+
+def build_offline_params_from_pooler(pooler) -> FDEParams:
+    return FDEParams(
+        G=pooler.params.G.clone(),
+        S=pooler.params.S.clone() if pooler.params.S is not None else None,
+        W=pooler.final_proj.W.clone() if pooler.final_proj is not None else None,
+        fill_empty_clusters=pooler.cfg.fill_empty_clusters,
+    )
+
+
+def test_fde_pooler_equivalence():
+    d = 128
+    for mode in ["query", "doc"]:
+        for use_final_proj in [False, True]:
+            d_final = 64 if use_final_proj else None
+            config = FDEConfig(
+                ksim=4, d_proj=8, R_reps=2, d_final=d_final, fill_empty_clusters=True, seed=42
+            )
+            pooler = FDEPooler(d=d, config=config)
+
+            # Single request
+            prompt_lens = torch.tensor([20], dtype=torch.int32)
+            is_doc = (mode == "doc")
+            pooling_params = [MockPoolingParams(is_document=is_doc)]
+            pooling_metadata = MockPoolingMetadata(
+                prompt_lens=prompt_lens, pooling_params=pooling_params
+            )
+
+            hidden_states = torch.randn(20, d)
+            
+            # 1. Pooler output
+            out_pooler = pooler(hidden_states, pooling_metadata).squeeze(0)
+
+            # 2. Offline output
+            params = build_offline_params_from_pooler(pooler)
+            # Ensure params are on same device/dtype
+            params.to(hidden_states.device, hidden_states.dtype)
+            
+            out_offline = encode_to_fde(hidden_states, params, mode=mode)
+
+            # Compare
+            max_diff = (out_pooler - out_offline).abs().max()
+            print(f"[mode={mode:5s} | final={str(use_final_proj):5s}] max_abs_diff = {max_diff:.3e}")
+            
+            assert torch.allclose(out_pooler, out_offline, atol=1e-5), \
+                f"Mismatch in mode={mode}, final={use_final_proj}, diff={max_diff}"
+
+    print("test_fde_pooler_equivalence passed")
+
+
+@dataclass
+class MockPoolingParams:
+    is_document: bool = False
+    normalize: bool = False
+
+
+def test_fde_pooler_shapes():
+    d = 128
+    config = FDEConfig(
+        ksim=4,  # B=16
+        d_proj=8,
+        R_reps=2,
+        d_final=None,
+        fill_empty_clusters=True,
+        seed=42,
+    )
+
+    pooler = FDEPooler(d=d, config=config)
+
+    # Simulate 2 requests
+    prompt_lens = torch.tensor([10, 5], dtype=torch.int32)
+    # Default pooling params (is_document=False)
+    pooling_params = [MockPoolingParams(), MockPoolingParams()]
+    pooling_metadata = MockPoolingMetadata(
+        prompt_lens=prompt_lens, pooling_params=pooling_params
+    )
+
+    hidden_states = torch.randn(15, d)
+
+    output = pooler(hidden_states, pooling_metadata)
+
+    # Expected output shape: (NumRequests, R * B * d_block)
+    # NumRequests=2, R=2, B=16, d_block=8 -> 256
+    expected_dim = 2 * 16 * 8
+    assert output.shape == (2, expected_dim)
+    assert not torch.isnan(output).any()
+    print("test_fde_pooler_shapes passed")
+
+
+def test_fde_pooler_final_proj():
+    d = 128
+    d_final = 64
+    config = FDEConfig(
+        ksim=4, d_proj=8, R_reps=2, d_final=d_final, fill_empty_clusters=True
+    )
+
+    pooler = FDEPooler(d=d, config=config)
+
+    prompt_lens = torch.tensor([10], dtype=torch.int32)
+    pooling_params = [MockPoolingParams()]
+    pooling_metadata = MockPoolingMetadata(
+        prompt_lens=prompt_lens, pooling_params=pooling_params
+    )
+
+    hidden_states = torch.randn(10, d)
+    output = pooler(hidden_states, pooling_metadata)
+
+    assert output.shape == (1, d_final)
+    print("test_fde_pooler_final_proj passed")
+
+
+def test_fde_pooler_doc_mode():
+    d = 128
+    config = FDEConfig(
+        ksim=4, d_proj=8, R_reps=2, d_final=None, fill_empty_clusters=True
+    )
+    pooler = FDEPooler(d=d, config=config)
+
+    prompt_lens = torch.tensor([10], dtype=torch.int32)
+    # Enable document mode
+    pooling_params = [MockPoolingParams(is_document=True)]
+    pooling_metadata = MockPoolingMetadata(
+        prompt_lens=prompt_lens, pooling_params=pooling_params
+    )
+
+    hidden_states = torch.randn(10, d)
+    output = pooler(hidden_states, pooling_metadata)
+
+    expected_dim = 1 * 2 * 16 * 8
+    assert output.shape == (1, expected_dim)
+    assert not torch.isnan(output).any()
+    print("test_fde_pooler_doc_mode passed")
+
+
+if __name__ == "__main__":
+    test_fde_pooler_shapes()
+    test_fde_pooler_final_proj()
+    test_fde_pooler_doc_mode()
+    test_fde_pooler_equivalence()
+
+--- END OF FILE: vllm/standalone_test_fde.py ---
+
+--- START OF FILE: vllm/entrypoints/openai/protocol.py ---
+# SPDX-License-Identifier: Apache-2.0
+
+# Adapted from
+# https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
+import json
+import re
+import time
+from argparse import Namespace
+from typing import Annotated, Any, ClassVar, Literal, Optional, Union
+
+import torch
+from fastapi import UploadFile
+from pydantic import (BaseModel, ConfigDict, Field, TypeAdapter,
+                      ValidationInfo, field_validator, model_validator)
+from typing_extensions import TypeAlias
+
+from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
+from vllm.logger import init_logger
+from vllm.pooling_params import PoolingParams
+from vllm.sampling_params import (BeamSearchParams, GuidedDecodingParams,
+                                  RequestOutputKind, SamplingParams)
+from vllm.sequence import Logprob
+from vllm.utils import random_uuid, resolve_obj_by_qualname
+
+logger = init_logger(__name__)
+
+# torch is mocked during docs generation,
+# so we have to provide the values as literals
+_MOCK_LONG_INFO = Namespace(min=-9223372036854775808, max=9223372036854775807)
+_LONG_INFO: Union["torch.iinfo", Namespace]
+
+try:
+    from sphinx.ext.autodoc.mock import _MockModule
+
+    if isinstance(torch, _MockModule):
+        _LONG_INFO = _MOCK_LONG_INFO
+    else:
+        _LONG_INFO = torch.iinfo(torch.long)
+except ModuleNotFoundError:
+    _LONG_INFO = torch.iinfo(torch.long)
+
+assert _LONG_INFO.min == _MOCK_LONG_INFO.min
+assert _LONG_INFO.max == _MOCK_LONG_INFO.max
+
+
+class OpenAIBaseModel(BaseModel):
+    # OpenAI API does allow extra fields
+    model_config = ConfigDict(extra="allow")
+
+    # Cache class field names
+    field_names: ClassVar[Optional[set[str]]] = None
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def __log_extra_fields__(cls, data, handler):
+        result = handler(data)
+        if not isinstance(data, dict):
+            return result
+        field_names = cls.field_names
+        if field_names is None:
+            # Get all class field names and their potential aliases
+            field_names = set()
+            for field_name, field in cls.model_fields.items():
+                field_names.add(field_name)
+                if alias := getattr(field, "alias", None):
+                    field_names.add(alias)
+            cls.field_names = field_names
+
+        # Compare against both field names and aliases
+        if any(k not in field_names for k in data):
+            logger.warning(
+                "The following fields were present in the request "
+                "but ignored: %s",
+                data.keys() - field_names,
+            )
+        return result
+
+
+class ErrorResponse(OpenAIBaseModel):
+    object: str = "error"
+    message: str
+    type: str
+    param: Optional[str] = None
+    code: int
+
+
+class ModelPermission(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"modelperm-{random_uuid()}")
+    object: str = "model_permission"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    allow_create_engine: bool = False
+    allow_sampling: bool = True
+    allow_logprobs: bool = True
+    allow_search_indices: bool = False
+    allow_view: bool = True
+    allow_fine_tuning: bool = False
+    organization: str = "*"
+    group: Optional[str] = None
+    is_blocking: bool = False
+
+
+class ModelCard(OpenAIBaseModel):
+    id: str
+    object: str = "model"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    owned_by: str = "vllm"
+    root: Optional[str] = None
+    parent: Optional[str] = None
+    max_model_len: Optional[int] = None
+    permission: list[ModelPermission] = Field(default_factory=list)
+
+
+class ModelList(OpenAIBaseModel):
+    object: str = "list"
+    data: list[ModelCard] = Field(default_factory=list)
+
+
+class PromptTokenUsageInfo(OpenAIBaseModel):
+    cached_tokens: Optional[int] = None
+
+
+class UsageInfo(OpenAIBaseModel):
+    prompt_tokens: int = 0
+    total_tokens: int = 0
+    completion_tokens: Optional[int] = 0
+    prompt_tokens_details: Optional[PromptTokenUsageInfo] = None
+
+
+class RequestResponseMetadata(BaseModel):
+    request_id: str
+    final_usage_info: Optional[UsageInfo] = None
+
+
+class JsonSchemaResponseFormat(OpenAIBaseModel):
+    name: str
+    description: Optional[str] = None
+    # schema is the field in openai but that causes conflicts with pydantic so
+    # instead use json_schema with an alias
+    json_schema: Optional[dict[str, Any]] = Field(default=None, alias='schema')
+    strict: Optional[bool] = None
+
+
+class StructuralTag(OpenAIBaseModel):
+    begin: str
+    # schema is the field, but that causes conflicts with pydantic so
+    # instead use structural_tag_schema with an alias
+    structural_tag_schema: Optional[dict[str, Any]] = Field(default=None,
+                                                            alias="schema")
+    end: str
+
+
+class StructuralTagResponseFormat(OpenAIBaseModel):
+    type: Literal["structural_tag"]
+    structures: list[StructuralTag]
+    triggers: list[str]
+
+
+class ResponseFormat(OpenAIBaseModel):
+    # type must be "json_schema", "json_object", or "text"
+    type: Literal["text", "json_object", "json_schema"]
+    json_schema: Optional[JsonSchemaResponseFormat] = None
+
+
+AnyResponseFormat = Union[ResponseFormat, StructuralTagResponseFormat]
+
+
+class StreamOptions(OpenAIBaseModel):
+    include_usage: Optional[bool] = True
+    continuous_usage_stats: Optional[bool] = False
+
+
+class FunctionDefinition(OpenAIBaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[dict[str, Any]] = None
+
+
+class ChatCompletionToolsParam(OpenAIBaseModel):
+    type: Literal["function"] = "function"
+    function: FunctionDefinition
+
+
+class ChatCompletionNamedFunction(OpenAIBaseModel):
+    name: str
+
+
+class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
+    function: ChatCompletionNamedFunction
+    type: Literal["function"] = "function"
+
+
+class LogitsProcessorConstructor(BaseModel):
+    qualname: str
+    args: Optional[list[Any]] = None
+    kwargs: Optional[dict[str, Any]] = None
+
+
+LogitsProcessors = list[Union[str, LogitsProcessorConstructor]]
+
+
+def get_logits_processors(processors: Optional[LogitsProcessors],
+                          pattern: Optional[str]) -> Optional[list[Any]]:
+    if processors and pattern:
+        logits_processors = []
+        for processor in processors:
+            qualname = processor if isinstance(processor,
+                                               str) else processor.qualname
+            if not re.match(pattern, qualname):
+                raise ValueError(
+                    f"Logits processor '{qualname}' is not allowed by this "
+                    "server. See --logits-processor-pattern engine argument "
+                    "for more information.")
+            try:
+                logits_processor = resolve_obj_by_qualname(qualname)
+            except Exception as e:
+                raise ValueError(
+                    f"Logits processor '{qualname}' could not be resolved: {e}"
+                ) from e
+            if isinstance(processor, LogitsProcessorConstructor):
+                logits_processor = logits_processor(*processor.args or [],
+                                                    **processor.kwargs or {})
+            logits_processors.append(logits_processor)
+        return logits_processors
+    elif processors:
+        raise ValueError(
+            "The `logits_processors` argument is not supported by this "
+            "server. See --logits-processor-pattern engine argugment "
+            "for more information.")
+    return None
+
+
+class ChatCompletionRequest(OpenAIBaseModel):
+    # Ordered by official OpenAI API documentation
+    # https://platform.openai.com/docs/api-reference/chat/create
+    messages: list[ChatCompletionMessageParam]
+    model: Optional[str] = None
+    frequency_penalty: Optional[float] = 0.0
+    logit_bias: Optional[dict[str, float]] = None
+    logprobs: Optional[bool] = False
+    top_logprobs: Optional[int] = 0
+    # TODO(#9845): remove max_tokens when field is removed from OpenAI API
+    max_tokens: Optional[int] = Field(
+        default=None,
+        deprecated=
+        'max_tokens is deprecated in favor of the max_completion_tokens field')
+    max_completion_tokens: Optional[int] = None
+    n: Optional[int] = 1
+    presence_penalty: Optional[float] = 0.0
+    response_format: Optional[AnyResponseFormat] = None
+    seed: Optional[int] = Field(None, ge=_LONG_INFO.min, le=_LONG_INFO.max)
+    stop: Optional[Union[str, list[str]]] = Field(default_factory=list)
+    stream: Optional[bool] = False
+    stream_options: Optional[StreamOptions] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    tools: Optional[list[ChatCompletionToolsParam]] = None
+    tool_choice: Optional[Union[
+        Literal["none"],
+        Literal["auto"],
+        Literal["required"],
+        ChatCompletionNamedToolChoiceParam,
+    ]] = "none"
+
+    # NOTE this will be ignored by vLLM -- the model determines the behavior
+    parallel_tool_calls: Optional[bool] = False
+    user: Optional[str] = None
+
+    # doc: begin-chat-completion-sampling-params
+    best_of: Optional[int] = None
+    use_beam_search: bool = False
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    length_penalty: float = 1.0
+    stop_token_ids: Optional[list[int]] = Field(default_factory=list)
+    include_stop_str_in_output: bool = False
+    ignore_eos: bool = False
+    min_tokens: int = 0
+    skip_special_tokens: bool = True
+    spaces_between_special_tokens: bool = True
+    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+    prompt_logprobs: Optional[int] = None
+    # doc: end-chat-completion-sampling-params
+
+    # doc: begin-chat-completion-extra-params
+    echo: bool = Field(
+        default=False,
+        description=(
+            "If true, the new message will be prepended with the last message "
+            "if they belong to the same role."),
+    )
+    add_generation_prompt: bool = Field(
+        default=True,
+        description=
+        ("If true, the generation prompt will be added to the chat template. "
+         "This is a parameter used by chat template in tokenizer config of the "
+         "model."),
+    )
+    continue_final_message: bool = Field(
+        default=False,
+        description=
+        ("If this is set, the chat will be formatted so that the final "
+         "message in the chat is open-ended, without any EOS tokens. The "
+         "model will continue this message rather than starting a new one. "
+         "This allows you to \"prefill\" part of the model's response for it. "
+         "Cannot be used at the same time as `add_generation_prompt`."),
+    )
+    add_special_tokens: bool = Field(
+        default=False,
+        description=(
+            "If true, special tokens (e.g. BOS) will be added to the prompt "
+            "on top of what is added by the chat template. "
+            "For most models, the chat template takes care of adding the "
+            "special tokens so this should be set to false (as is the "
+            "default)."),
+    )
+    documents: Optional[list[dict[str, str]]] = Field(
+        default=None,
+        description=
+        ("A list of dicts representing documents that will be accessible to "
+         "the model if it is performing RAG (retrieval-augmented generation)."
+         " If the template does not support RAG, this argument will have no "
+         "effect. We recommend that each document should be a dict containing "
+         "\"title\" and \"text\" keys."),
+    )
+    chat_template: Optional[str] = Field(
+        default=None,
+        description=(
+            "A Jinja template to use for this conversion. "
+            "As of transformers v4.44, default chat template is no longer "
+            "allowed, so you must provide a chat template if the tokenizer "
+            "does not define one."),
+    )
+    chat_template_kwargs: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=("Additional kwargs to pass to the template renderer. "
+                     "Will be accessible by the chat template."),
+    )
+    mm_processor_kwargs: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=("Additional kwargs to pass to the HF processor."),
+    )
+    guided_json: Optional[Union[str, dict, BaseModel]] = Field(
+        default=None,
+        description=("If specified, the output will follow the JSON schema."),
+    )
+    guided_regex: Optional[str] = Field(
+        default=None,
+        description=(
+            "If specified, the output will follow the regex pattern."),
+    )
+    guided_choice: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "If specified, the output will be exactly one of the choices."),
+    )
+    guided_grammar: Optional[str] = Field(
+        default=None,
+        description=(
+            "If specified, the output will follow the context free grammar."),
+    )
+    structural_tag: Optional[str] = Field(
+        default=None,
+        description=(
+            "If specified, the output will follow the structural tag schema."),
+    )
+    guided_decoding_backend: Optional[str] = Field(
+        default=None,
+        description=(
+            "If specified, will override the default guided decoding backend "
+            "of the server for this specific request. If set, must be either "
+            "'outlines' / 'lm-format-enforcer'"),
+    )
+    guided_whitespace_pattern: Optional[str] = Field(
+        default=None,
+        description=(
+            "If specified, will override the default whitespace pattern "
+            "for guided json decoding."),
+    )
+    priority: int = Field(
+        default=0,
+        description=(
+            "The priority of the request (lower means earlier handling; "
+            "default: 0). Any priority other than 0 will raise an error "
+            "if the served model does not use priority scheduling."),
+    )
+    request_id: str = Field(
+        default_factory=lambda: f"{random_uuid()}",
+        description=(
+            "The request_id related to this request. If the caller does "
+            "not set it, a random_uuid will be generated. This id is used "
+            "through out the inference process and return in response."),
+    )
+    logits_processors: Optional[LogitsProcessors] = Field(
+        default=None,
+        description=(
+            "A list of either qualified names of logits processors, or "
+            "constructor objects, to apply when sampling. A constructor is "
+            "a JSON object with a required 'qualname' field specifying the "
+            "qualified name of the processor class/factory, and optional "
+            "'args' and 'kwargs' fields containing positional and keyword "
+            "arguments. For example: {'qualname': "
+            "'my_module.MyLogitsProcessor', 'args': [1, 2], 'kwargs': "
+            "{'param': 'value'}}."))
+    return_tokens_as_token_ids: Optional[bool] = Field(
+        default=None,
+        description=(
+            "If specified with 'logprobs', tokens are represented "
+            " as strings of the form 'token_id:{token_id}' so that tokens "
+            "that are not JSON-encodable can be identified."))
+
+    # doc: end-chat-completion-extra-params
+
+    # Default sampling parameters for chat completion requests
+    _DEFAULT_SAMPLING_PARAMS: dict = {
+        "repetition_penalty": 1.0,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "min_p": 0.0,
+    }
+
+    def to_beam_search_params(
+            self,
+            default_max_tokens: int,
+            default_sampling_params: Optional[dict] = None
+    ) -> BeamSearchParams:
+        # TODO(#9845): remove max_tokens when field is removed from OpenAI API
+        max_tokens = self.max_completion_tokens or self.max_tokens
+
+        if default_sampling_params is None:
+            default_sampling_params = {}
+        n = self.n if self.n is not None else 1
+
+        # Use minimum of context window, user request & server limit.
+        max_tokens = min(
+            val for val in (default_max_tokens, max_tokens,
+                            default_sampling_params.get("max_tokens", None))
+            if val is not None)
+
+        if (temperature := self.temperature) is None:
+            temperature = default_sampling_params.get(
+                "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"])
+
+        return BeamSearchParams(
+            beam_width=n,
+            max_tokens=max_tokens,
+            ignore_eos=self.ignore_eos,
+            temperature=temperature,
+            length_penalty=self.length_penalty,
+            include_stop_str_in_output=self.include_stop_str_in_output,
+        )
+
+    def to_sampling_params(
+        self,
+        default_max_tokens: int,
+        logits_processor_pattern: Optional[str],
+        default_sampling_params: Optional[dict] = None,
+    ) -> SamplingParams:
+        # TODO(#9845): remove max_tokens when field is removed from OpenAI API
+        max_tokens = self.max_completion_tokens or self.max_tokens
+
+        if default_sampling_params is None:
+            default_sampling_params = {}
+
+        # Use minimum of context window, user request & server limit.
+        max_tokens = min(
+            val for val in (default_max_tokens, max_tokens,
+                            default_sampling_params.get("max_tokens", None))
+            if val is not None)
+
+        # Default parameters
+        if (repetition_penalty := self.repetition_penalty) is None:
+            repetition_penalty = default_sampling_params.get(
+                "repetition_penalty",
+                self._DEFAULT_SAMPLING_PARAMS["repetition_penalty"],
+            )
+        if (temperature := self.temperature) is None:
+            temperature = default_sampling_params.get(
+                "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"])
+        if (top_p := self.top_p) is None:
+            top_p = default_sampling_params.get(
+                "top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"])
+        if (top_k := self.top_k) is None:
+            top_k = default_sampling_params.get(
+                "top_k", self._DEFAULT_SAMPLING_PARAMS["top_k"])
+        if (min_p := self.min_p) is None:
+            min_p = default_sampling_params.get(
+                "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"])
+
+        prompt_logprobs = self.prompt_logprobs
+        if prompt_logprobs is None and self.echo:
+            prompt_logprobs = self.top_logprobs
+
+        guided_json_object = None
+        if self.response_format is not None:
+            if self.response_format.type == "json_object":
+                guided_json_object = True
+            elif self.response_format.type == "json_schema":
+                json_schema = self.response_format.json_schema
+                assert json_schema is not None
+                self.guided_json = json_schema.json_schema
+            elif self.response_format.type == "structural_tag":
+                structural_tag = self.response_format
+                assert structural_tag is not None and isinstance(
+                    structural_tag, StructuralTagResponseFormat)
+                s_tag_obj = structural_tag.model_dump(by_alias=True)
+                self.structural_tag = json.dumps(s_tag_obj)
+
+        guided_decoding = GuidedDecodingParams.from_optional(
+            json=self._get_guided_json_from_tool() or self.guided_json,
+            regex=self.guided_regex,
+            choice=self.guided_choice,
+            grammar=self.guided_grammar,
+            json_object=guided_json_object,
+            backend=self.guided_decoding_backend,
+            whitespace_pattern=self.guided_whitespace_pattern,
+            structural_tag=self.structural_tag,
+        )
+
+        return SamplingParams.from_optional(
+            n=self.n,
+            best_of=self.best_of,
+            presence_penalty=self.presence_penalty,
+            frequency_penalty=self.frequency_penalty,
+            repetition_penalty=repetition_penalty,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            seed=self.seed,
+            stop=self.stop,
+            stop_token_ids=self.stop_token_ids,
+            logprobs=self.top_logprobs if self.logprobs else None,
+            prompt_logprobs=prompt_logprobs,
+            ignore_eos=self.ignore_eos,
+            max_tokens=max_tokens,
+            min_tokens=self.min_tokens,
+            skip_special_tokens=self.skip_special_tokens,
+            spaces_between_special_tokens=self.spaces_between_special_tokens,
+            logits_processors=get_logits_processors(self.logits_processors,
+                                                    logits_processor_pattern),
+            include_stop_str_in_output=self.include_stop_str_in_output,
+            truncate_prompt_tokens=self.truncate_prompt_tokens,
+            output_kind=RequestOutputKind.DELTA if self.stream \
+                else RequestOutputKind.FINAL_ONLY,
+            guided_decoding=guided_decoding,
+            logit_bias=self.logit_bias)
+
+    def _get_guided_json_from_tool(
+            self) -> Optional[Union[str, dict, BaseModel]]:
+        # user has chosen to not use any tool
+        if self.tool_choice == "none" or self.tools is None:
+            return None
+
+        # user has chosen to use a named tool
+        if type(self.tool_choice) is ChatCompletionNamedToolChoiceParam:
+            tool_name = self.tool_choice.function.name
+            tools = {tool.function.name: tool.function for tool in self.tools}
+            if tool_name not in tools:
+                raise ValueError(
+                    f"Tool '{tool_name}' has not been passed in `tools`.")
+            tool = tools[tool_name]
+            return tool.parameters
+
+        if self.tool_choice == "required":
+            # Pydantic schema generation cannot be used since the JSON schema
+            # has to be constructed for a specific instantiation of a tool list
+            # so that parameters of a function are correctly generated
+            # based on the chosen function name
+            def get_tool_schema(tool: ChatCompletionToolsParam) -> dict:
+                return {
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "enum": [tool.function.name]
+                        },
+                        # parameters are always generated as '{}' in the final
+                        # output if they are missing from the request
+                        # (i.e. are None or '{}') so the schema is
+                        # updated to produce an empty object in that case
+                        "parameters": tool.function.parameters
+                        if tool.function.parameters else {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    },
+                    "required": ["name", "parameters"]
+                }
+
+            json_schema = {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "anyOf": [get_tool_schema(tool) for tool in self.tools]
+                }
+            }
+            return json_schema
+
+        return None
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_stream_options(cls, data):
+        if data.get("stream_options") and not data.get("stream"):
+            raise ValueError(
+                "Stream options can only be defined when `stream=True`.")
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_logprobs(cls, data):
+        if (prompt_logprobs := data.get("prompt_logprobs")) is not None:
+            if data.get("stream") and prompt_logprobs > 0:
+                raise ValueError(
+                    "`prompt_logprobs` are not available when `stream=True`.")
+
+            if prompt_logprobs < 0:
+                raise ValueError("`prompt_logprobs` must be a positive value.")
+
+        if (top_logprobs := data.get("top_logprobs")) is not None:
+            if top_logprobs < 0:
+                raise ValueError("`top_logprobs` must be a positive value.")
+
+            if top_logprobs > 0 and not data.get("logprobs"):
+                raise ValueError(
+                    "when using `top_logprobs`, `logprobs` must be set to true."
+                )
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_guided_decoding_count(cls, data):
+        if isinstance(data, ValueError):
+            raise data
+
+        guide_count = sum([
+            "guided_json" in data and data["guided_json"] is not None,
+            "guided_regex" in data and data["guided_regex"] is not None,
+            "guided_choice" in data and data["guided_choice"] is not None
+        ])
+        # you can only use one kind of guided decoding
+        if guide_count > 1:
+            raise ValueError(
+                "You can only use one kind of guided decoding "
+                "('guided_json', 'guided_regex' or 'guided_choice').")
+        # you can only either use guided decoding or tools, not both
+        if guide_count > 1 and data.get("tool_choice", "none") not in (
+                "none",
+                "auto",
+                "required",
+        ):
+            raise ValueError(
+                "You can only either use guided decoding or tools, not both.")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_tool_usage(cls, data):
+
+        # if "tool_choice" is not specified but tools are provided,
+        # default to "auto" tool_choice
+        if "tool_choice" not in data and data.get("tools"):
+            data["tool_choice"] = "auto"
+
+        # if "tool_choice" is "none" -- ignore tools if present
+        if "tool_choice" in data and data["tool_choice"] == "none":
+            # ensure that no tools are present
+            data.pop("tools", None)
+            return data
+
+        # if "tool_choice" is specified -- validation
+        if "tool_choice" in data:
+
+            # ensure that if "tool choice" is specified, tools are present
+            if "tools" not in data or data["tools"] is None:
+                raise ValueError(
+                    "When using `tool_choice`, `tools` must be set.")
+
+            # make sure that tool choice is either a named tool
+            # OR that it's set to "auto" or "required"
+            if data["tool_choice"] not in [
+                    "auto", "required"
+            ] and not isinstance(data["tool_choice"], dict):
+                raise NotImplementedError(
+                    f'Invalid value for `tool_choice`: {data["tool_choice"]}! '\
+                    'Only named tools, "none", "auto" or "required" '\
+                    'are supported.'
+                )
+
+            # ensure that if "tool_choice" is specified as an object,
+            # it matches a valid tool
+            if isinstance(data["tool_choice"], dict):
+                valid_tool = False
+                specified_function = data["tool_choice"].get("function")
+                if not specified_function:
+                    raise ValueError(
+                        "Expected field `function` in `tool_choice`."
+                        " Correct usage: `{\"type\": \"function\","
+                        " \"function\": {\"name\": \"my_function\"}}`")
+                specified_function_name = specified_function.get("name")
+                if not specified_function_name:
+                    raise ValueError(
+                        "Expected field `name` in `function` in `tool_choice`."
+                        "Correct usage: `{\"type\": \"function\", "
+                        "\"function\": {\"name\": \"my_function\"}}`")
+                for tool in data["tools"]:
+                    if tool["function"]["name"] == specified_function_name:
+                        valid_tool = True
+                        break
+                if not valid_tool:
+                    raise ValueError(
+                        "The tool specified in `tool_choice` does not match any"
+                        " of the specified `tools`")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_generation_prompt(cls, data):
+        if data.get("continue_final_message") and data.get(
+                "add_generation_prompt"):
+            raise ValueError("Cannot set both `continue_final_message` and "
+                             "`add_generation_prompt` to True.")
+        return data
+
+
+class CompletionRequest(OpenAIBaseModel):
+    # Ordered by official OpenAI API documentation
+    # https://platform.openai.com/docs/api-reference/completions/create
+    model: Optional[str] = None
+    prompt: Union[list[int], list[list[int]], str, list[str]]
+    best_of: Optional[int] = None
+    echo: Optional[bool] = False
+    frequency_penalty: Optional[float] = 0.0
+    logit_bias: Optional[dict[str, float]] = None
+    logprobs: Optional[int] = None
+    max_tokens: Optional[int] = 16
+    n: int = 1
+    presence_penalty: Optional[float] = 0.0
+    seed: Optional[int] = Field(None, ge=_LONG_INFO.min, le=_LONG_INFO.max)
+    stop: Optional[Union[str, list[str]]] = Field(default_factory=list)
+    stream: Optional[bool] = False
+    stream_options: Optional[StreamOptions] = None
+    suffix: Optional[str] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    user: Optional[str] = None
+
+    # doc: begin-completion-sampling-params
+    use_beam_search: bool = False
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    length_penalty: float = 1.0
+    stop_token_ids: Optional[list[int]] = Field(default_factory=list)
+    include_stop_str_in_output: bool = False
+    ignore_eos: bool = False
+    min_tokens: int = 0
+    skip_special_tokens: bool = True
+    spaces_between_special_tokens: bool = True
+    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+    allowed_token_ids: Optional[list[int]] = None
+    prompt_logprobs: Optional[int] = None
+    # doc: end-completion-sampling-params
+
+    # doc: begin-completion-extra-params
+    add_special_tokens: bool = Field(
+        default=True,
+        description=(
+            "If true (the default), special tokens (e.g. BOS) will be added to "
+            "the prompt."),
+    )
+    response_format: Optional[AnyResponseFormat] = Field(
+        default=None,
+        description=(
+            "Similar to chat completion, this parameter specifies the format "
+            "of output. Only {'type': 'json_object'}, {'type': 'json_schema'}"
+            ", {'type': 'structural_tag'}, or {'type': 'text' } is supported."
+        ),
+    )
+    guided_json: Optional[Union[str, dict, BaseModel]] = Field(
+        default=None,
+        description="If specified, the output will follow the JSON schema.",
+    )
+    guided_regex: Optional[str] = Field(
+        default=None,
+        description=(
+            "If specified, the output will follow the regex pattern."),
+    )
+    guided_choice: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "If specified, the output will be exactly one of the choices."),
+    )
+    guided_grammar: Optional[str] = Field(
+        default=None,
+        description=(
+            "If specified, the output will follow the context free grammar."),
+    )
+    guided_decoding_backend: Optional[str] = Field(
+        default=None,
+        description=(
+            "If specified, will override the default guided decoding backend "
+            "of the server for this specific request. If set, must be one of "
+            "'outlines' / 'lm-format-enforcer'"),
+    )
+    guided_whitespace_pattern: Optional[str] = Field(
+        default=None,
+        description=(
+            "If specified, will override the default whitespace pattern "
+            "for guided json decoding."),
+    )
+    priority: int = Field(
+        default=0,
+        description=(
+            "The priority of the request (lower means earlier handling; "
+            "default: 0). Any priority other than 0 will raise an error "
+            "if the served model does not use priority scheduling."),
+    )
+    logits_processors: Optional[LogitsProcessors] = Field(
+        default=None,
+        description=(
+            "A list of either qualified names of logits processors, or "
+            "constructor objects, to apply when sampling. A constructor is "
+            "a JSON object with a required 'qualname' field specifying the "
+            "qualified name of the processor class/factory, and optional "
+            "'args' and 'kwargs' fields containing positional and keyword "
+            "arguments. For example: {'qualname': "
+            "'my_module.MyLogitsProcessor', 'args': [1, 2], 'kwargs': "
+            "{'param': 'value'}}."))
+
+    return_tokens_as_token_ids: Optional[bool] = Field(
+        default=None,
+        description=(
+            "If specified with 'logprobs', tokens are represented "
+            " as strings of the form 'token_id:{token_id}' so that tokens "
+            "that are not JSON-encodable can be identified."))
+
+    # doc: end-completion-extra-params
+
+    # Default sampling parameters for completion requests
+    _DEFAULT_SAMPLING_PARAMS: dict = {
+        "repetition_penalty": 1.0,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "min_p": 0.0,
+    }
+
+    def to_beam_search_params(
+            self,
+            default_max_tokens: int,
+            default_sampling_params: Optional[dict] = None
+    ) -> BeamSearchParams:
+        max_tokens = self.max_tokens
+
+        if default_sampling_params is None:
+            default_sampling_params = {}
+        n = self.n if self.n is not None else 1
+
+        # Use minimum of context window, user request & server limit.
+        max_tokens = min(
+            val for val in (default_max_tokens, max_tokens,
+                            default_sampling_params.get("max_tokens", None))
+            if val is not None)
+
+        if (temperature := self.temperature) is None:
+            temperature = default_sampling_params.get("temperature", 1.0)
+
+        return BeamSearchParams(
+            beam_width=n,
+            max_tokens=max_tokens,
+            ignore_eos=self.ignore_eos,
+            temperature=temperature,
+            length_penalty=self.length_penalty,
+            include_stop_str_in_output=self.include_stop_str_in_output,
+        )
+
+    def to_sampling_params(
+        self,
+        default_max_tokens: int,
+        logits_processor_pattern: Optional[str],
+        default_sampling_params: Optional[dict] = None,
+    ) -> SamplingParams:
+        max_tokens = self.max_tokens
+
+        if default_sampling_params is None:
+            default_sampling_params = {}
+
+        # Use minimum of context window, user request & server limit.
+        max_tokens = min(
+            val for val in (default_max_tokens, max_tokens,
+                            default_sampling_params.get("max_tokens", None))
+            if val is not None)
+
+        # Default parameters
+        if (repetition_penalty := self.repetition_penalty) is None:
+            repetition_penalty = default_sampling_params.get(
+                "repetition_penalty",
+                self._DEFAULT_SAMPLING_PARAMS["repetition_penalty"],
+            )
+        if (temperature := self.temperature) is None:
+            temperature = default_sampling_params.get(
+                "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"])
+        if (top_p := self.top_p) is None:
+            top_p = default_sampling_params.get(
+                "top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"])
+        if (top_k := self.top_k) is None:
+            top_k = default_sampling_params.get(
+                "top_k", self._DEFAULT_SAMPLING_PARAMS["top_k"])
+        if (min_p := self.min_p) is None:
+            min_p = default_sampling_params.get(
+                "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"])
+
+        prompt_logprobs = self.prompt_logprobs
+        if prompt_logprobs is None and self.echo:
+            prompt_logprobs = self.logprobs
+
+        echo_without_generation = self.echo and self.max_tokens == 0
+
+        guided_json_object = None
+        if (self.response_format is not None
+                and self.response_format.type == "json_object"):
+            guided_json_object = True
+
+        guided_decoding = GuidedDecodingParams.from_optional(
+            json=self.guided_json,
+            regex=self.guided_regex,
+            choice=self.guided_choice,
+            grammar=self.guided_grammar,
+            json_object=guided_json_object,
+            backend=self.guided_decoding_backend,
+            whitespace_pattern=self.guided_whitespace_pattern,
+        )
+
+        return SamplingParams.from_optional(
+            n=self.n,
+            best_of=self.best_of,
+            presence_penalty=self.presence_penalty,
+            frequency_penalty=self.frequency_penalty,
+            repetition_penalty=repetition_penalty,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            seed=self.seed,
+            stop=self.stop,
+            stop_token_ids=self.stop_token_ids,
+            logprobs=self.logprobs,
+            ignore_eos=self.ignore_eos,
+            max_tokens=max_tokens if not echo_without_generation else 1,
+            min_tokens=self.min_tokens,
+            prompt_logprobs=prompt_logprobs,
+            skip_special_tokens=self.skip_special_tokens,
+            spaces_between_special_tokens=self.spaces_between_special_tokens,
+            include_stop_str_in_output=self.include_stop_str_in_output,
+            logits_processors=get_logits_processors(self.logits_processors,
+                                                    logits_processor_pattern),
+            truncate_prompt_tokens=self.truncate_prompt_tokens,
+            output_kind=RequestOutputKind.DELTA if self.stream \
+                else RequestOutputKind.FINAL_ONLY,
+            guided_decoding=guided_decoding,
+            logit_bias=self.logit_bias,
+            allowed_token_ids=self.allowed_token_ids)
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_guided_decoding_count(cls, data):
+        guide_count = sum([
+            "guided_json" in data and data["guided_json"] is not None,
+            "guided_regex" in data and data["guided_regex"] is not None,
+            "guided_choice" in data and data["guided_choice"] is not None
+        ])
+        if guide_count > 1:
+            raise ValueError(
+                "You can only use one kind of guided decoding "
+                "('guided_json', 'guided_regex' or 'guided_choice').")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_logprobs(cls, data):
+        if (prompt_logprobs := data.get("prompt_logprobs")) is not None:
+            if data.get("stream") and prompt_logprobs > 0:
+                raise ValueError(
+                    "`prompt_logprobs` are not available when `stream=True`.")
+
+            if prompt_logprobs < 0:
+                raise ValueError("`prompt_logprobs` must be a positive value.")
+
+        if (logprobs := data.get("logprobs")) is not None and logprobs < 0:
+            raise ValueError("`logprobs` must be a positive value.")
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_stream_options(cls, data):
+        if data.get("stream_options") and not data.get("stream"):
+            raise ValueError(
+                "Stream options can only be defined when `stream=True`.")
+
+        return data
+
+
+class EmbeddingCompletionRequest(OpenAIBaseModel):
+    # Ordered by official OpenAI API documentation
+    # https://platform.openai.com/docs/api-reference/embeddings
+    model: Optional[str] = None
+    input: Union[list[int], list[list[int]], str, list[str]]
+    encoding_format: Literal["float", "base64"] = "float"
+    dimensions: Optional[int] = None
+    user: Optional[str] = None
+    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+    # doc: begin-embedding-pooling-params
+    additional_data: Optional[Any] = None
+    is_document: bool = Field(
+        default=False,
+        description="Whether this input represents a document (for FDE models). "
+        "Set to true for corpus documents, false for queries.")
+    # doc: end-embedding-pooling-params
+
+    # doc: begin-embedding-extra-params
+    add_special_tokens: bool = Field(
+        default=True,
+        description=(
+            "If true (the default), special tokens (e.g. BOS) will be added to "
+            "the prompt."),
+    )
+    priority: int = Field(
+        default=0,
+        description=(
+            "The priority of the request (lower means earlier handling; "
+            "default: 0). Any priority other than 0 will raise an error "
+            "if the served model does not use priority scheduling."),
+    )
+
+    # doc: end-embedding-extra-params
+
+    def to_pooling_params(self):
+        return PoolingParams(dimensions=self.dimensions,
+                             additional_data=self.additional_data,
+                             is_document=self.is_document)
+
+
+class EmbeddingChatRequest(OpenAIBaseModel):
+    model: Optional[str] = None
+    messages: list[ChatCompletionMessageParam]
+
+    encoding_format: Literal["float", "base64"] = "float"
+    dimensions: Optional[int] = None
+    user: Optional[str] = None
+    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+
+    # doc: begin-chat-embedding-pooling-params
+    additional_data: Optional[Any] = None
+    is_document: bool = Field(
+        default=False,
+        description="Whether this input represents a document (for FDE models). "
+        "Set to true for corpus documents, false for queries.")
+    # doc: end-chat-embedding-pooling-params
+
+    # doc: begin-chat-embedding-extra-params
+    add_special_tokens: bool = Field(
+        default=False,
+        description=(
+            "If true, special tokens (e.g. BOS) will be added to the prompt "
+            "on top of what is added by the chat template. "
+            "For most models, the chat template takes care of adding the "
+            "special tokens so this should be set to false (as is the "
+            "default)."),
+    )
+    chat_template: Optional[str] = Field(
+        default=None,
+        description=(
+            "A Jinja template to use for this conversion. "
+            "As of transformers v4.44, default chat template is no longer "
+            "allowed, so you must provide a chat template if the tokenizer "
+            "does not define one."),
+    )
+    chat_template_kwargs: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=("Additional kwargs to pass to the template renderer. "
+                     "Will be accessible by the chat template."),
+    )
+    mm_processor_kwargs: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=("Additional kwargs to pass to the HF processor."),
+    )
+    priority: int = Field(
+        default=0,
+        description=(
+            "The priority of the request (lower means earlier handling; "
+            "default: 0). Any priority other than 0 will raise an error "
+            "if the served model does not use priority scheduling."),
+    )
+    # doc: end-chat-embedding-extra-params
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_generation_prompt(cls, data):
+        if data.get("continue_final_message") and data.get(
+                "add_generation_prompt"):
+            raise ValueError("Cannot set both `continue_final_message` and "
+                             "`add_generation_prompt` to True.")
+        return data
+
+    def to_pooling_params(self):
+        return PoolingParams(dimensions=self.dimensions,
+                             additional_data=self.additional_data,
+                             is_document=self.is_document)
+
+
+EmbeddingRequest = Union[EmbeddingCompletionRequest, EmbeddingChatRequest]
+
+PoolingCompletionRequest = EmbeddingCompletionRequest
+PoolingChatRequest = EmbeddingChatRequest
+PoolingRequest = Union[PoolingCompletionRequest, PoolingChatRequest]
+
+
+class ScoreRequest(OpenAIBaseModel):
+    model: Optional[str] = None
+    text_1: Union[list[str], str]
+    text_2: Union[list[str], str]
+    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+
+    # doc: begin-score-pooling-params
+    additional_data: Optional[Any] = None
+    # doc: end-score-pooling-params
+
+    # doc: begin-score-extra-params
+    priority: int = Field(
+        default=0,
+        description=(
+            "The priority of the request (lower means earlier handling; "
+            "default: 0). Any priority other than 0 will raise an error "
+            "if the served model does not use priority scheduling."),
+    )
+
+    # doc: end-score-extra-params
+
+    def to_pooling_params(self):
+        return PoolingParams(additional_data=self.additional_data)
+
+
+class RerankRequest(OpenAIBaseModel):
+    model: Optional[str] = None
+    query: str
+    documents: list[str]
+    top_n: int = Field(default_factory=lambda: 0)
+    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+
+    # doc: begin-rerank-pooling-params
+    additional_data: Optional[Any] = None
+    # doc: end-rerank-pooling-params
+
+    # doc: begin-rerank-extra-params
+    priority: int = Field(
+        default=0,
+        description=(
+            "The priority of the request (lower means earlier handling; "
+            "default: 0). Any priority other than 0 will raise an error "
+            "if the served model does not use priority scheduling."),
+    )
+
+    # doc: end-rerank-extra-params
+
+    def to_pooling_params(self):
+        return PoolingParams(additional_data=self.additional_data)
+
+
+class RerankDocument(BaseModel):
+    text: str
+
+
+class RerankResult(BaseModel):
+    index: int
+    document: RerankDocument
+    relevance_score: float
+
+
+class RerankUsage(BaseModel):
+    total_tokens: int
+
+
+class RerankResponse(OpenAIBaseModel):
+    id: str
+    model: str
+    usage: RerankUsage
+    results: list[RerankResult]
+
+
+class CompletionLogProbs(OpenAIBaseModel):
+    text_offset: list[int] = Field(default_factory=list)
+    token_logprobs: list[Optional[float]] = Field(default_factory=list)
+    tokens: list[str] = Field(default_factory=list)
+    top_logprobs: list[Optional[dict[str,
+                                     float]]] = Field(default_factory=list)
+
+
+class CompletionResponseChoice(OpenAIBaseModel):
+    index: int
+    text: str
+    logprobs: Optional[CompletionLogProbs] = None
+    finish_reason: Optional[str] = None
+    stop_reason: Optional[Union[int, str]] = Field(
+        default=None,
+        description=(
+            "The stop string or token id that caused the completion "
+            "to stop, None if the completion finished for some other reason "
+            "including encountering the EOS token"),
+    )
+    prompt_logprobs: Optional[list[Optional[dict[int, Logprob]]]] = None
+
+
+class CompletionResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"cmpl-{random_uuid()}")
+    object: str = "text_completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: list[CompletionResponseChoice]
+    usage: UsageInfo
+
+
+class CompletionResponseStreamChoice(OpenAIBaseModel):
+    index: int
+    text: str
+    logprobs: Optional[CompletionLogProbs] = None
+    finish_reason: Optional[str] = None
+    stop_reason: Optional[Union[int, str]] = Field(
+        default=None,
+        description=(
+            "The stop string or token id that caused the completion "
+            "to stop, None if the completion finished for some other reason "
+            "including encountering the EOS token"),
+    )
+
+
+class CompletionStreamResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"cmpl-{random_uuid()}")
+    object: str = "text_completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: list[CompletionResponseStreamChoice]
+    usage: Optional[UsageInfo] = Field(default=None)
+
+
+class EmbeddingResponseData(OpenAIBaseModel):
+    index: int
+    object: str = "embedding"
+    embedding: Union[list[float], str]
+
+
+class EmbeddingResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"embd-{random_uuid()}")
+    object: str = "list"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    data: list[EmbeddingResponseData]
+    usage: UsageInfo
+
+
+class PoolingResponseData(OpenAIBaseModel):
+    index: int
+    object: str = "pooling"
+    data: Union[list[list[float]], list[float], str]
+
+
+class PoolingResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"pool-{random_uuid()}")
+    object: str = "list"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    data: list[PoolingResponseData]
+    usage: UsageInfo
+
+
+class ScoreResponseData(OpenAIBaseModel):
+    index: int
+    object: str = "score"
+    score: float
+
+
+class ScoreResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"embd-{random_uuid()}")
+    object: str = "list"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    data: list[ScoreResponseData]
+    usage: UsageInfo
+
+
+class FunctionCall(OpenAIBaseModel):
+    name: str
+    arguments: str
+
+
+class ToolCall(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"chatcmpl-tool-{random_uuid()}")
+    type: Literal["function"] = "function"
+    function: FunctionCall
+
+
+class DeltaFunctionCall(BaseModel):
+    name: Optional[str] = None
+    arguments: Optional[str] = None
+
+
+# a tool call delta where everything is optional
+class DeltaToolCall(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"chatcmpl-tool-{random_uuid()}")
+    type: Literal["function"] = "function"
+    index: int
+    function: Optional[DeltaFunctionCall] = None
+
+
+class ExtractedToolCallInformation(BaseModel):
+    # indicate if tools were called
+    tools_called: bool
+
+    # extracted tool calls
+    tool_calls: list[ToolCall]
+
+    # content - per OpenAI spec, content AND tool calls can be returned rarely
+    # But some models will do this intentionally
+    content: Optional[str] = None
+
+
+class ChatMessage(OpenAIBaseModel):
+    role: str
+    reasoning_content: Optional[str] = None
+    content: Optional[str] = None
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+
+
+class ChatCompletionLogProb(OpenAIBaseModel):
+    token: str
+    logprob: float = -9999.0
+    bytes: Optional[list[int]] = None
+
+
+class ChatCompletionLogProbsContent(ChatCompletionLogProb):
+    # Workaround: redefine fields name cache so that it's not
+    # shared with the super class.
+    field_names: ClassVar[Optional[set[str]]] = None
+    top_logprobs: list[ChatCompletionLogProb] = Field(default_factory=list)
+
+
+class ChatCompletionLogProbs(OpenAIBaseModel):
+    content: Optional[list[ChatCompletionLogProbsContent]] = None
+
+
+class ChatCompletionResponseChoice(OpenAIBaseModel):
+    index: int
+    message: ChatMessage
+    logprobs: Optional[ChatCompletionLogProbs] = None
+    # per OpenAI spec this is the default
+    finish_reason: Optional[str] = "stop"
+    # not part of the OpenAI spec but included in vLLM for legacy reasons
+    stop_reason: Optional[Union[int, str]] = None
+
+
+class ChatCompletionResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: list[ChatCompletionResponseChoice]
+    usage: UsageInfo
+    prompt_logprobs: Optional[list[Optional[dict[int, Logprob]]]] = None
+
+
+class DeltaMessage(OpenAIBaseModel):
+    role: Optional[str] = None
+    content: Optional[str] = None
+    reasoning_content: Optional[str] = None
+    tool_calls: list[DeltaToolCall] = Field(default_factory=list)
+
+
+class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
+    index: int
+    delta: DeltaMessage
+    logprobs: Optional[ChatCompletionLogProbs] = None
+    finish_reason: Optional[str] = None
+    stop_reason: Optional[Union[int, str]] = None
+
+
+class ChatCompletionStreamResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: list[ChatCompletionResponseStreamChoice]
+    usage: Optional[UsageInfo] = Field(default=None)
+
+
+class TranscriptionResponseStreamChoice(OpenAIBaseModel):
+    delta: DeltaMessage
+    finish_reason: Optional[str] = None
+    stop_reason: Optional[Union[int, str]] = None
+
+
+class TranscriptionStreamResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"trsc-{random_uuid()}")
+    object: Literal["transcription.chunk"] = "transcription.chunk"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: list[TranscriptionResponseStreamChoice]
+    usage: Optional[UsageInfo] = Field(default=None)
+
+
+class BatchRequestInput(OpenAIBaseModel):
+    """
+    The per-line object of the batch input file.
+
+    NOTE: Currently only the `/v1/chat/completions` endpoint is supported.
+    """
+
+    # A developer-provided per-request id that will be used to match outputs to
+    # inputs. Must be unique for each request in a batch.
+    custom_id: str
+
+    # The HTTP method to be used for the request. Currently only POST is
+    # supported.
+    method: str
+
+    # The OpenAI API relative URL to be used for the request. Currently
+    # /v1/chat/completions is supported.
+    url: str
+
+    # The parameters of the request.
+    body: Union[ChatCompletionRequest, EmbeddingRequest, ScoreRequest]
+
+    @field_validator('body', mode='plain')
+    @classmethod
+    def check_type_for_url(cls, value: Any, info: ValidationInfo):
+        # Use url to disambiguate models
+        url = info.data['url']
+        if url == "/v1/chat/completions":
+            return ChatCompletionRequest.model_validate(value)
+        if url == "/v1/embeddings":
+            return TypeAdapter(EmbeddingRequest).validate_python(value)
+        if url == "/v1/score":
+            return ScoreRequest.model_validate(value)
+        return TypeAdapter(Union[ChatCompletionRequest, EmbeddingRequest,
+                                 ScoreRequest]).validate_python(value)
+
+
+class BatchResponseData(OpenAIBaseModel):
+    # HTTP status code of the response.
+    status_code: int = 200
+
+    # An unique identifier for the API request.
+    request_id: str
+
+    # The body of the response.
+    body: Optional[Union[ChatCompletionResponse, EmbeddingResponse,
+                         ScoreResponse]] = None
+
+
+class BatchRequestOutput(OpenAIBaseModel):
+    """
+    The per-line object of the batch output and error files
+    """
+
+    id: str
+
+    # A developer-provided per-request id that will be used to match outputs to
+    # inputs.
+    custom_id: str
+
+    response: Optional[BatchResponseData]
+
+    # For requests that failed with a non-HTTP error, this will contain more
+    # information on the cause of the failure.
+    error: Optional[Any]
+
+
+class TokenizeCompletionRequest(OpenAIBaseModel):
+    model: Optional[str] = None
+    prompt: str
+
+    add_special_tokens: bool = Field(
+        default=True,
+        description=(
+            "If true (the default), special tokens (e.g. BOS) will be added to "
+            "the prompt."),
+    )
+
+
+class TokenizeChatRequest(OpenAIBaseModel):
+    model: Optional[str] = None
+    messages: list[ChatCompletionMessageParam]
+
+    add_generation_prompt: bool = Field(
+        default=True,
+        description=
+        ("If true, the generation prompt will be added to the chat template. "
+         "This is a parameter used by chat template in tokenizer config of the "
+         "model."),
+    )
+    continue_final_message: bool = Field(
+        default=False,
+        description=
+        ("If this is set, the chat will be formatted so that the final "
+         "message in the chat is open-ended, without any EOS tokens. The "
+         "model will continue this message rather than starting a new one. "
+         "This allows you to \"prefill\" part of the model's response for it. "
+         "Cannot be used at the same time as `add_generation_prompt`."),
+    )
+    add_special_tokens: bool = Field(
+        default=False,
+        description=(
+            "If true, special tokens (e.g. BOS) will be added to the prompt "
+            "on top of what is added by the chat template. "
+            "For most models, the chat template takes care of adding the "
+            "special tokens so this should be set to false (as is the "
+            "default)."),
+    )
+    chat_template: Optional[str] = Field(
+        default=None,
+        description=(
+            "A Jinja template to use for this conversion. "
+            "As of transformers v4.44, default chat template is no longer "
+            "allowed, so you must provide a chat template if the tokenizer "
+            "does not define one."),
+    )
+    chat_template_kwargs: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=("Additional kwargs to pass to the template renderer. "
+                     "Will be accessible by the chat template."),
+    )
+    mm_processor_kwargs: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=("Additional kwargs to pass to the HF processor."),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_generation_prompt(cls, data):
+        if data.get("continue_final_message") and data.get(
+                "add_generation_prompt"):
+            raise ValueError("Cannot set both `continue_final_message` and "
+                             "`add_generation_prompt` to True.")
+        return data
+
+
+TokenizeRequest = Union[TokenizeCompletionRequest, TokenizeChatRequest]
+
+
+class TokenizeResponse(OpenAIBaseModel):
+    count: int
+    max_model_len: int
+    tokens: list[int]
+
+
+class DetokenizeRequest(OpenAIBaseModel):
+    model: Optional[str] = None
+    tokens: list[int]
+
+
+class DetokenizeResponse(OpenAIBaseModel):
+    prompt: str
+
+
+class LoadLoRAAdapterRequest(BaseModel):
+    lora_name: str
+    lora_path: str
+
+
+class UnloadLoRAAdapterRequest(BaseModel):
+    lora_name: str
+    lora_int_id: Optional[int] = Field(default=None)
+
+
+## Protocols for Audio
+AudioResponseFormat: TypeAlias = Literal["json", "text", "srt", "verbose_json",
+                                         "vtt"]
+
+
+class TranscriptionRequest(OpenAIBaseModel):
+    # Ordered by official OpenAI API documentation
+    # https://platform.openai.com/docs/api-reference/audio/createTranscription
+
+    file: UploadFile
+    """
+    The audio file object (not file name) to transcribe, in one of these
+    formats: flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, or webm.
+    """
+
+    model: Optional[str] = None
+    """ID of the model to use.
+    """
+
+    language: Optional[str] = None
+    """The language of the input audio.
+
+    Supplying the input language in
+    [ISO-639-1](https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes) format
+    will improve accuracy and latency.
+    """
+
+    prompt: str = Field(default="")
+    """An optional text to guide the model's style or continue a previous audio
+    segment.
+
+    The [prompt](https://platform.openai.com/docs/guides/speech-to-text#prompting)
+    should match the audio language.
+    """
+
+    response_format: AudioResponseFormat = Field(default="json")
+    """
+    The format of the output, in one of these options: `json`, `text`, `srt`,
+    `verbose_json`, or `vtt`.
+    """
+
+    ## TODO (varun) : Support if set to 0, certain thresholds are met !!
+
+    timestamp_granularities: list[Literal["word", "segment"]] = Field(
+        alias="timestamp_granularities[]", default=[])
+    """The timestamp granularities to populate for this transcription.
+
+    `response_format` must be set `verbose_json` to use timestamp granularities.
+    Either or both of these options are supported: `word`, or `segment`. Note:
+    There is no additional latency for segment timestamps, but generating word
+    timestamps incurs additional latency.
+    """
+
+    # doc: begin-transcription-extra-params
+    stream: Optional[bool] = False
+    """Custom field not present in the original OpenAI definition. When set, 
+    it will enable output to be streamed in a similar fashion as the Chat
+    Completion endpoint. 
+    """
+    # Flattened stream option to simplify form data.
+    stream_include_usage: Optional[bool] = False
+    stream_continuous_usage_stats: Optional[bool] = False
+    # doc: end-transcription-extra-params
+
+    # doc: begin-transcription-sampling-params
+    temperature: float = Field(default=0.0)
+    """The sampling temperature, between 0 and 1.
+
+    Higher values like 0.8 will make the output more random, while lower values
+    like 0.2 will make it more focused / deterministic. If set to 0, the model
+    will use [log probability](https://en.wikipedia.org/wiki/Log_probability)
+    to automatically increase the temperature until certain thresholds are hit.
+    """
+
+    top_p: Optional[float] = None
+    """Enables nucleus (top-p) sampling, where tokens are selected from the 
+    smallest possible set whose cumulative probability exceeds `p`.
+    """
+
+    top_k: Optional[int] = None
+    """Limits sampling to the `k` most probable tokens at each step."""
+
+    min_p: Optional[float] = None
+    """Filters out tokens with a probability lower than `min_p`, ensuring a 
+    minimum likelihood threshold during sampling.
+    """
+
+    seed: Optional[int] = Field(None, ge=_LONG_INFO.min, le=_LONG_INFO.max)
+    """The seed to use for sampling."""
+
+    frequency_penalty: Optional[float] = 0.0
+    """The frequency penalty to use for sampling."""
+
+    repetition_penalty: Optional[float] = None
+    """The repetition penalty to use for sampling."""
+
+    presence_penalty: Optional[float] = 0.0
+    """The presence penalty to use for sampling."""
+    # doc: end-transcription-sampling-params
+
+    # Default sampling parameters for transcription requests.
+    _DEFAULT_SAMPLING_PARAMS: dict = {
+        "repetition_penalty": 1.0,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "min_p": 0.0,
+    }
+
+    def to_sampling_params(
+            self,
+            default_max_tokens: int,
+            default_sampling_params: Optional[dict] = None) -> SamplingParams:
+        # TODO(#9845): remove max_tokens when field is removed from OpenAI API
+        max_tokens = default_max_tokens
+
+        if default_sampling_params is None:
+            default_sampling_params = {}
+
+        # Default parameters
+        if (temperature := self.temperature) is None:
+            temperature = default_sampling_params.get(
+                "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"])
+        if (top_p := self.top_p) is None:
+            top_p = default_sampling_params.get(
+                "top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"])
+        if (top_k := self.top_k) is None:
+            top_k = default_sampling_params.get(
+                "top_k", self._DEFAULT_SAMPLING_PARAMS["top_k"])
+        if (min_p := self.min_p) is None:
+            min_p = default_sampling_params.get(
+                "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"])
+
+        if (repetition_penalty := self.repetition_penalty) is None:
+            repetition_penalty = default_sampling_params.get(
+                "repetition_penalty",
+                self._DEFAULT_SAMPLING_PARAMS["repetition_penalty"])
+
+        return SamplingParams.from_optional(temperature=temperature,
+                                            max_tokens=max_tokens,
+                                            seed=self.seed,
+                                            top_p=top_p,
+                                            top_k=top_k,
+                                            min_p=min_p,
+                                            frequency_penalty=self.frequency_penalty,
+                                            repetition_penalty=repetition_penalty,
+                                            presence_penalty=self.presence_penalty,
+                                            output_kind=RequestOutputKind.DELTA
+                                            if self.stream \
+                                            else RequestOutputKind.FINAL_ONLY)
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_stream_options(cls, data):
+        stream_opts = ["stream_include_usage", "stream_continuous_usage_stats"]
+        stream = data.get("stream", False)
+        if any(bool(data.get(so, False)) for so in stream_opts) and not stream:
+            raise ValueError(
+                "Stream options can only be defined when `stream=True`.")
+
+        return data
+
+
+# Transcription response objects
+class TranscriptionResponse(OpenAIBaseModel):
+    text: str
+    """The transcribed text."""
+
+
+class TranscriptionWord(OpenAIBaseModel):
+    end: float
+    """End time of the word in seconds."""
+
+    start: float
+    """Start time of the word in seconds."""
+
+    word: str
+    """The text content of the word."""
+
+
+class TranscriptionSegment(OpenAIBaseModel):
+    id: int
+    """Unique identifier of the segment."""
+
+    avg_logprob: float
+    """Average logprob of the segment.
+
+    If the value is lower than -1, consider the logprobs failed.
+    """
+
+    compression_ratio: float
+    """Compression ratio of the segment.
+
+    If the value is greater than 2.4, consider the compression failed.
+    """
+
+    end: float
+    """End time of the segment in seconds."""
+
+    no_speech_prob: float
+    """Probability of no speech in the segment.
+
+    If the value is higher than 1.0 and the `avg_logprob` is below -1, consider
+    this segment silent.
+    """
+
+    seek: int
+    """Seek offset of the segment."""
+
+    start: float
+    """Start time of the segment in seconds."""
+
+    temperature: float
+    """Temperature parameter used for generating the segment."""
+
+    text: str
+    """Text content of the segment."""
+
+    tokens: list[int]
+    """Array of token IDs for the text content."""
+
+
+class TranscriptionResponseVerbose(OpenAIBaseModel):
+    duration: str
+    """The duration of the input audio."""
+
+    language: str
+    """The language of the input audio."""
+
+    text: str
+    """The transcribed text."""
+
+    segments: Optional[list[TranscriptionSegment]] = None
+    """Segments of the transcribed text and their corresponding details."""
+
+    words: Optional[list[TranscriptionWord]] = None
+    """Extracted words and their corresponding timestamps."""
+
+--- END OF FILE: vllm/entrypoints/openai/protocol.py ---
+
+--- START OF FILE: vllm/test_fde_logic_standalone.py ---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import unittest
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# --- Copied/Adapted Logic from FDEPooler ---
+
+
+@dataclass
+class FDEConfig:
+    ksim: int = 6
+    d_proj: int = 32
+    R_reps: int = 10
+    d_final: int | None = None
+    fill_empty_clusters: bool = False
+    seed: int = 42
+    use_mixed_precision: bool = False
+
+
+class BatchedParams(nn.Module):
+    def __init__(self, d: int, ksim: int, d_proj: int | None, R: int, seed: int):
+        super().__init__()
+        g = torch.Generator()
+        g.manual_seed(seed)
+        self.register_buffer("G", torch.randn(R, d, ksim, generator=g, device="cpu"))
+        self.use_proj = bool(d_proj and d_proj > 0 and d_proj != d)
+        if self.use_proj:
+            s_init = (
+                torch.randint(
+                    0, 2, (R, d_proj, d), dtype=torch.int8, generator=g, device="cpu"
+                )
+                * 2
+                - 1
+            ).to(torch.float32)
+            self.register_buffer("S", s_init)
+        else:
+            self.register_buffer("S", None)
+
+
+class FinalProjectionStreamer(nn.Module):
+    def __init__(self, d_in: int, d_out: int):
+        super().__init__()
+        self.d_in = d_in
+        self.d_out = d_out
+        self.register_buffer("W", torch.randn(d_out, d_in))
+
+    def forward(self, x_flat: torch.Tensor) -> torch.Tensor:
+        return x_flat @ self.W.t()
+
+
+@dataclass
+class MockPoolingParams:
+    is_document: bool = False
+    normalize: bool = False
+
+
+@dataclass
+class MockPoolingMetadata:
+    prompt_lens: torch.Tensor | None = None
+    pooling_params: list[MockPoolingParams] | None = None
+
+
+class StandaloneFDEPooler(nn.Module):
+    def __init__(self, d: int, config: FDEConfig):
+        super().__init__()
+        self.d = d
+        self.cfg = config
+        self.R = config.R_reps
+        self.B = 1 << config.ksim
+
+        self.params = BatchedParams(d, config.ksim, config.d_proj, self.R, config.seed)
+
+        d_block = config.d_proj if (self.params.use_proj and config.d_proj) else d
+        self.d_block = d_block
+        self.d_FDE = self.B * d_block * self.R
+
+        if config.d_final:
+            self.final_proj = FinalProjectionStreamer(self.d_FDE, config.d_final)
+        else:
+            self.final_proj = None
+
+        self.chunk_size = 65536
+
+    def _normalize_rows(self, x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        return x / (x.norm(dim=-1, keepdim=True) + eps)
+
+    def _buckets_batched(self, X: torch.Tensor, G: torch.Tensor) -> torch.Tensor:
+        logits = torch.einsum("td,Rdk->tRk", X, G)
+        bits = (logits > 0).to(torch.int64)
+        powers = 1 << torch.arange(G.size(-1), device=X.device, dtype=torch.int64)
+        return (bits * powers).sum(dim=-1)
+
+    def _project_block_batched(
+        self, blocks: torch.Tensor, S: torch.Tensor | None
+    ) -> torch.Tensor:
+        if S is None:
+            return blocks
+        return torch.einsum("NRBd,Rpd->NRBp", blocks, S)
+
+    def _fill_empty_doc_buckets_hcube(self, centroids, counts, is_document):
+        N, R, B, d = centroids.shape
+        ksim = self.cfg.ksim
+        device = centroids.device
+        masks = 1 << torch.arange(ksim, device=device, dtype=torch.long)
+
+        for n in range(N):
+            if not bool(is_document[n]):
+                continue
+            for r in range(R):
+                present = counts[n, r] > 0
+                if present.all():
+                    continue
+                empty_mask = ~present
+                empty_idx = torch.nonzero(empty_mask, as_tuple=False).squeeze(-1)
+                if empty_idx.numel() == 0:
+                    continue
+                for b in empty_idx.tolist():
+                    b_val = int(b)
+                    n1 = (b_val ^ masks).clamp_(0, B - 1)
+                    cand = n1[present[n1]]
+                    if cand.numel() > 0:
+                        centroids[n, r, b] = centroids[n, r, int(cand[0])]
+                        continue
+                    found = False
+                    for i in range(ksim):
+                        if found:
+                            break
+                        mi = int(masks[i])
+                        for j in range(i + 1, ksim):
+                            nb = b_val ^ mi ^ int(masks[j])
+                            if 0 <= nb < B and present[nb]:
+                                centroids[n, r, b] = centroids[n, r, nb]
+                                found = True
+                                break
+        return centroids
+
+    def forward(
+        self, hidden_states: torch.Tensor, pooling_metadata: MockPoolingMetadata
+    ) -> torch.Tensor:
+        if isinstance(hidden_states, list):
+            hidden_states = torch.cat(hidden_states, dim=0)
+
+        X = self._normalize_rows(hidden_states)
+
+        # Ensure params are on correct device
+        if self.params.G.device != X.device or self.params.G.dtype != X.dtype:
+            self.params.to(device=X.device, dtype=X.dtype)
+            if self.final_proj:
+                self.final_proj.to(device=X.device, dtype=X.dtype)
+
+        prompt_lens = pooling_metadata.prompt_lens.to(X.device)
+        num_reqs = len(prompt_lens)
+        req_ids = torch.repeat_interleave(
+            torch.arange(num_reqs, device=X.device), prompt_lens
+        )
+
+        pooling_params = pooling_metadata.pooling_params or []
+        if pooling_params:
+            is_document = torch.tensor(
+                [getattr(p, "is_document", False) for p in pooling_params],
+                device=X.device,
+                dtype=torch.bool,
+            )
+        else:
+            is_document = torch.zeros(num_reqs, device=X.device, dtype=torch.bool)
+
+        out_dim = num_reqs * self.R * self.B
+        sums = torch.zeros((out_dim, self.d), device=X.device, dtype=X.dtype)
+        counts_flat = torch.zeros(out_dim, dtype=X.dtype, device=X.device)
+
+        chunk_size = self.chunk_size
+        num_tokens = X.size(0)
+        G = self.params.G
+
+        for start_idx in range(0, num_tokens, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_tokens)
+            X_chunk = X[start_idx:end_idx]
+            req_ids_chunk = req_ids[start_idx:end_idx]
+            chunk_len = end_idx - start_idx
+
+            bids_chunk = self._buckets_batched(X_chunk, G)
+
+            req_ids_expanded = req_ids_chunk.unsqueeze(1).expand(-1, self.R)
+            rep_ids = (
+                torch.arange(self.R, device=X.device).unsqueeze(0).expand(chunk_len, -1)
+            )
+
+            global_indices = (
+                req_ids_expanded * (self.R * self.B) + rep_ids * self.B + bids_chunk
+            )
+            flat_indices = global_indices.reshape(-1)
+
+            X_chunk_expanded = (
+                X_chunk.unsqueeze(1).expand(-1, self.R, -1).reshape(-1, self.d)
+            )
+
+            sums.index_add_(0, flat_indices, X_chunk_expanded)
+            ones = torch.ones_like(flat_indices, dtype=X.dtype, device=X.device)
+            counts_flat.index_add_(0, flat_indices, ones)
+
+        sums = sums.view(num_reqs, self.R, self.B, self.d)
+        counts = counts_flat.view(num_reqs, self.R, self.B)
+
+        blocks_in = sums
+        if is_document.any():
+            counts_safe = counts.clamp_min(1.0)[..., None]
+            means = sums / counts_safe
+            is_doc_3d = is_document.view(num_reqs, 1, 1)
+            mask_doc = is_doc_3d.expand_as(counts)
+            blocks_in = torch.where(mask_doc[..., None], means, sums)
+            if self.cfg.fill_empty_clusters:
+                blocks_in = self._fill_empty_doc_buckets_hcube(
+                    blocks_in, counts, is_document
+                )
+
+        blocks_in = F.normalize(blocks_in, p=2, dim=-1, eps=1e-6)
+        S = self.params.S
+        blocks = self._project_block_batched(blocks_in, S)
+        flat = blocks.reshape(num_reqs, -1)
+
+        if self.final_proj:
+            output = self.final_proj(flat)
+        else:
+            output = flat
+
+        if pooling_params and any(p.normalize for p in pooling_params):
+            do_normalize = torch.tensor(
+                [p.normalize for p in pooling_params],
+                device=output.device,
+                dtype=torch.bool,
+            )
+            if do_normalize.all():
+                output = F.normalize(output, p=2, dim=-1)
+            elif do_normalize.any():
+                normalized = F.normalize(output, p=2, dim=-1)
+                output = torch.where(do_normalize.unsqueeze(1), normalized, output)
+        return output
+
+
+class TestFDEMinibatchEquivalence(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(42)
+        self.device = torch.device("cpu")
+        self.d = 128
+        self.config = FDEConfig(
+            ksim=4, d_proj=16, R_reps=5, d_final=None, fill_empty_clusters=True, seed=42
+        )
+        self.pooler = StandaloneFDEPooler(d=self.d, config=self.config).to(self.device)
+
+    def test_minibatch_equivalence(self):
+        num_reqs = 10
+        prompt_lens_list = [50, 100, 20, 80, 200, 30, 40, 60, 90, 10]
+        total_tokens = sum(prompt_lens_list)
+
+        hidden_states = torch.randn(total_tokens, self.d, device=self.device)
+        prompt_lens = torch.tensor(prompt_lens_list, device=self.device)
+
+        pooling_params = [
+            MockPoolingParams(is_document=(i % 2 == 0)) for i in range(num_reqs)
+        ]
+        metadata = MockPoolingMetadata(
+            prompt_lens=prompt_lens, pooling_params=pooling_params
+        )
+
+        # 1. Full batch (chunk_size > total_tokens)
+        self.pooler.chunk_size = 65536
+        with torch.no_grad():
+            output_full = self.pooler(hidden_states, metadata)
+
+        # 2. Mini batch (chunk_size small)
+        self.pooler.chunk_size = 32
+        with torch.no_grad():
+            output_chunked = self.pooler(hidden_states, metadata)
+
+        diff = (output_full - output_chunked).abs().max().item()
+        print(f"Max difference: {diff}")
+        self.assertTrue(
+            torch.allclose(output_full, output_chunked, atol=1e-5, rtol=1e-4)
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+--- END OF FILE: vllm/test_fde_logic_standalone.py ---
+
+--- START OF FILE: vllm/Dockerfile.fde ---
+# SPDX-License-Identifier: Apache-2.0
+# Dockerfile for vLLM v0.8.5 with MUVERA FDE support
+# Compatible with: L40S (SM89), RTX 3090 (SM86), A100 (SM80)
+#
+# Build: docker build -f vllm/Dockerfile.fde -t vllm-fde:v085 .
+# Run:   docker run --gpus all -p 8000:8000 vllm-fde:v085
+
+# Use NVIDIA CUDA 11.8 base image with cuDNN
+# CUDA 11.8 requires driver >= 520.61 (compatible with driver 535.x on L40S)
+FROM docker.io/nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-dev \
+    git \
+    curl \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /workspace
+
+# Install uv for fast Python package management
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+# Create virtual environment
+RUN uv venv /workspace/.venv
+ENV VIRTUAL_ENV=/workspace/.venv
+ENV PATH="/workspace/.venv/bin:$PATH"
+
+# Install PyTorch 2.6.0 with CUDA 11.8 support
+# PyTorch 2.6.0 only has cu118 and cu124 builds (no cu121)
+# cu118 wheels are forward-compatible with CUDA 12.3 runtime
+RUN uv pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
+    --index-url https://download.pytorch.org/whl/cu118
+
+# Install build dependencies
+RUN uv pip install setuptools wheel cmake ninja packaging setuptools-scm
+
+# Copy vLLM source code
+COPY . /workspace/vllm
+
+# Set CUDA architectures for compilation
+# SM80 = A100, SM86 = RTX 3090, SM89 = L40S
+ENV TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9"
+
+# Install vLLM in editable mode
+WORKDIR /workspace/vllm
+RUN uv pip install -e . --no-build-isolation
+
+# Copy FDE conversion script to accessible location
+RUN cp /workspace/vllm/vllm/convert_to_fde_config.py /workspace/convert_to_fde_config.py 2>/dev/null || true
+
+# Set default port
+EXPOSE 8000
+
+# Default command - ready to run without kubectl patch
+CMD ["python3", "-m", "vllm.entrypoints.openai.api_server", \
+     "--model", "/workspace/bge-m3-fde", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--trust-remote-code", \
+     "--enforce-eager", \
+     "--gpu-memory-utilization", "0.9"]
+
+--- END OF FILE: vllm/Dockerfile.fde ---
+
