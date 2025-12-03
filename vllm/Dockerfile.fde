@@ -57,6 +57,10 @@ RUN uv pip install -e . --no-build-isolation
 # Copy FDE conversion script to accessible location
 RUN cp /workspace/vllm/vllm/convert_to_fde_config.py /workspace/convert_to_fde_config.py 2>/dev/null || true
 
+# Copy pre-generated FDE params (ensures consistency across sessions)
+# Generated with: python scripts/generate_fde_params.py --d 1024 --ksim 4 --d-proj 32 --R-reps 24 --seed 42
+COPY fde_params.pt /workspace/fde_params.pt
+
 # Set default port
 EXPOSE 8000
 
