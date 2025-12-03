@@ -61,4 +61,4 @@ RUN cp /workspace/vllm/vllm/convert_to_fde_config.py /workspace/convert_to_fde_c
 EXPOSE 8000
 
 # Default command - ready to run without kubectl patch
-CMD ["/bin/bash", "-c", "python3 -m vllm.convert_to_fde_config --model BAAI/bge-m3 --output /workspace/bge-m3-fde --use-colbert --ksim 4 --d_proj 32 --R_reps 24 --fde-params /workspace/fde_params.pt && python3 -m vllm.entrypoints.openai.api_server --model /workspace/bge-m3-fde --host 0.0.0.0 --port 8000 --trust-remote-code --enforce-eager --gpu-memory-utilization 0.9"]
+CMD ["/bin/bash", "-c", "python3 -m vllm.convert_to_fde_config --model BAAI/bge-m3 --output /workspace/bge-m3-fde --use-colbert --ksim 4 --d_proj 32 --R_reps 24 --fill_empty_clusters --fde-params /workspace/fde_params.pt && python3 -m vllm.entrypoints.openai.api_server --model /workspace/bge-m3-fde --host 0.0.0.0 --port 8000 --trust-remote-code --enforce-eager --gpu-memory-utilization 0.9"]
