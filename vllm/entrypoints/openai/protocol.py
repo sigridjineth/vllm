@@ -1015,9 +1015,13 @@ class EmbeddingCompletionRequest(OpenAIBaseModel):
     dimensions: Optional[int] = None
     user: Optional[str] = None
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
-
     # doc: begin-embedding-pooling-params
     additional_data: Optional[Any] = None
+    is_document: bool = Field(
+        default=False,
+        description="Whether this input represents a document (for FDE models). "
+                    "Set to true for corpus documents, false for queries."
+    )
     # doc: end-embedding-pooling-params
 
     # doc: begin-embedding-extra-params
@@ -1039,7 +1043,8 @@ class EmbeddingCompletionRequest(OpenAIBaseModel):
 
     def to_pooling_params(self):
         return PoolingParams(dimensions=self.dimensions,
-                             additional_data=self.additional_data)
+                             additional_data=self.additional_data,
+                             is_document=self.is_document)
 
 
 class EmbeddingChatRequest(OpenAIBaseModel):
@@ -1053,6 +1058,11 @@ class EmbeddingChatRequest(OpenAIBaseModel):
 
     # doc: begin-chat-embedding-pooling-params
     additional_data: Optional[Any] = None
+    is_document: bool = Field(
+        default=False,
+        description="Whether this input represents a document (for FDE models). "
+                    "Set to true for corpus documents, false for queries."
+    )
     # doc: end-chat-embedding-pooling-params
 
     # doc: begin-chat-embedding-extra-params
@@ -1102,7 +1112,8 @@ class EmbeddingChatRequest(OpenAIBaseModel):
 
     def to_pooling_params(self):
         return PoolingParams(dimensions=self.dimensions,
-                             additional_data=self.additional_data)
+                             additional_data=self.additional_data,
+                             is_document=self.is_document)
 
 
 EmbeddingRequest = Union[EmbeddingCompletionRequest, EmbeddingChatRequest]
