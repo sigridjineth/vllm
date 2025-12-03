@@ -113,10 +113,35 @@ class FDEPooler(nn.Module):
         # Chunk size for mini-batch processing to prevent OOM
         self.chunk_size = 65536
 
+        # Precompute Hamming distance matrix for global empty bucket filling
+        if config.fill_empty_clusters:
+            self.register_buffer("hamming_matrix", self._compute_hamming_matrix(config.ksim), persistent=False)
+
     # --- 내부 유틸 ---
 
     def _normalize_rows(self, x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
         return x / (x.norm(dim=-1, keepdim=True) + eps)
+
+    def _compute_hamming_matrix(self, ksim: int) -> torch.Tensor:
+        """
+        Compute (B, B) Hamming distance matrix where B = 2^ksim.
+        """
+        B = 1 << ksim
+        # Generate all numbers from 0 to B-1
+        ids = torch.arange(B, dtype=torch.long)
+        # Compute XOR between all pairs: (B, 1) ^ (1, B) -> (B, B)
+        xor_matrix = ids.unsqueeze(1) ^ ids.unsqueeze(0)
+        # Count set bits (population count)
+        # Note: bit_count() is available in PyTorch 2.1+. For compatibility, we can use a loop or other method if needed.
+        # Assuming PyTorch 2.0+, bit_count is not available on Tensor?
+        # Actually, let's use a simple method for small ksim.
+        dist_matrix = torch.zeros((B, B), dtype=torch.long)
+        # We can use bitwise operations.
+        # Since ksim is small (e.g. 6), we can just sum the bits.
+        for i in range(ksim):
+            mask = 1 << i
+            dist_matrix += ((xor_matrix & mask) > 0).long()
+        return dist_matrix
 
     def _buckets_batched(self, X: torch.Tensor, G: torch.Tensor) -> torch.Tensor:
         """
@@ -139,29 +164,31 @@ class FDEPooler(nn.Module):
         if S is None:
             return blocks
         # blocks: (N, R, B, d), S: (R, d_proj, d) -> (N, R, B, d_proj)
-        return torch.einsum("NRBd,Rpd->NRBp", blocks, S)
+        # Reference implementation scales by 1/sqrt(d_proj)
+        projected = torch.einsum("NRBd,Rpd->NRBp", blocks, S)
+        d_proj = S.size(1)
+        return projected * (d_proj ** -0.5)
 
-    def _fill_empty_doc_buckets_hcube(
+    def _fill_empty_doc_buckets_global(
         self,
         centroids: torch.Tensor,  # (N, R, B, d)
         counts: torch.Tensor,  # (N, R, B)
         is_document: torch.Tensor,  # (N,)
     ) -> torch.Tensor:
         """
-        For doc mode: fill empty buckets using Hamming neighbors in the SimHash hypercube.
-        Strategy:
-          - radius 1 neighbors first
-          - if none present, radius 2
-          - else leave as is (rare)
+        For doc mode: fill empty buckets using GLOBAL Hamming neighbors.
         """
         N, R, B, d = centroids.shape
-        ksim = self.cfg.ksim
         device = centroids.device
 
-        masks = 1 << torch.arange(ksim, device=device, dtype=torch.long)  # (ksim,)
+        # Ensure hamming matrix is on the correct device
+        if self.hamming_matrix.device != device:
+            self.hamming_matrix = self.hamming_matrix.to(device)
+        
+        hamming_matrix = self.hamming_matrix # (B, B)
 
         for n in range(N):
-            if not bool(is_document[n]):  # 쿼리 row는 skip
+            if not bool(is_document[n]):  # Skip query rows
                 continue
 
             for r in range(R):
@@ -170,32 +197,25 @@ class FDEPooler(nn.Module):
                     continue
 
                 empty_mask = ~present
-                empty_idx = torch.nonzero(empty_mask, as_tuple=False).squeeze(-1)
-                if empty_idx.numel() == 0:
+                # Indices of empty and filled buckets
+                empty_indices = torch.nonzero(empty_mask, as_tuple=False).squeeze(-1) # (NumEmpty,)
+                filled_indices = torch.nonzero(present, as_tuple=False).squeeze(-1)   # (NumFilled,)
+
+                if filled_indices.numel() == 0:
+                    # If ALL buckets are empty (rare, e.g. zero tokens?), nothing to fill from.
                     continue
+                
+                # Compute distances from each empty bucket to all filled buckets
+                # (NumEmpty, NumFilled)
+                dists = hamming_matrix[empty_indices][:, filled_indices]
+                
+                # Find nearest filled bucket for each empty bucket
+                nearest_idx_in_filled = torch.argmin(dists, dim=1) # (NumEmpty,)
+                nearest_filled_buckets = filled_indices[nearest_idx_in_filled] # (NumEmpty,)
 
-                for b in empty_idx.tolist():
-                    b_val = int(b)
+                # Fill
+                centroids[n, r, empty_indices] = centroids[n, r, nearest_filled_buckets]
 
-                    # ---- radius 1 ----
-                    n1 = (b_val ^ masks).clamp_(0, B - 1)  # (ksim,)
-                    cand = n1[present[n1]]
-                    if cand.numel() > 0:
-                        centroids[n, r, b] = centroids[n, r, int(cand[0])]
-                        continue
-
-                    # ---- radius 2 ----
-                    found = False
-                    for i in range(ksim):
-                        if found:
-                            break
-                        mi = int(masks[i])
-                        for j in range(i + 1, ksim):
-                            nb = b_val ^ mi ^ int(masks[j])
-                            if 0 <= nb < B and present[nb]:
-                                centroids[n, r, b] = centroids[n, r, nb]
-                                found = True
-                                break
         return centroids
 
     # --- main forward ---
@@ -328,14 +348,14 @@ class FDEPooler(nn.Module):
 
             # --- doc 전용 empty bucket fill (옵션) ---
             if self.cfg.fill_empty_clusters:
-                # Hypercube neighbor fill (쿼리 row는 내부에서 skip됨)
-                blocks_in = self._fill_empty_doc_buckets_hcube(
+                # Global Hamming neighbor fill (skip query rows internally)
+                blocks_in = self._fill_empty_doc_buckets_global(
                     blocks_in, counts, is_document
                 )
 
         # --- Bucket-level L2 Normalization (MUVERA paper alignment) ---
-        # Use eps=1e-6 to avoid NaN in fp16 when buckets are empty (zero vectors)
-        blocks_in = F.normalize(blocks_in, p=2, dim=-1, eps=1e-6)
+        # REMOVED to align with rule-of-thumb reference code
+        # blocks_in = F.normalize(blocks_in, p=2, dim=-1, eps=1e-6)
 
         # Inner projection ψ
         S = self.params.S
