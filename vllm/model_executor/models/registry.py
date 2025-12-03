@@ -122,6 +122,7 @@ _TEXT_GENERATION_MODELS = {
 _EMBEDDING_MODELS = {
     # [Text-only]
     "BertModel": ("bert", "BertEmbeddingModel"),
+    "BgeM3FDE": ("bge_m3_fde", "BgeM3FDE"),
     "BgeM3FDEModel": ("bge_m3_fde", "BgeM3FDE"),
     "DeciLMForCausalLM": ("nemotron_nas", "DeciLMForCausalLM"),
     "Gemma2Model": ("gemma2", "Gemma2ForCausalLM"),
