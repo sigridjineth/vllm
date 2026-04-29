@@ -3,6 +3,7 @@
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
+from math import lcm
 
 import regex as re
 import torch
@@ -80,10 +81,15 @@ def _padded_moe_intermediate_size(
     weight_block_size = getattr(quant_config, "weight_block_size", None)
     if weight_block_size is None or len(weight_block_size) < 2:
         return intermediate_size
-    block_k = int(weight_block_size[1])
-    alignment = tp_size * block_k
-    if alignment <= 0:
+    block_n, block_k = int(weight_block_size[0]), int(weight_block_size[1])
+    if tp_size <= 0 or block_n <= 0 or block_k <= 0:
         return intermediate_size
+
+    # Row-parallel down projection requires the intermediate dimension shard
+    # to align with block_k, while merged gate/up column-parallel scales are
+    # sharded at block_n granularity. Padding to TP * lcm(block_n, block_k)
+    # satisfies both without mutating the HF config object.
+    alignment = tp_size * lcm(block_n, block_k)
     return _ceil_div(intermediate_size, alignment) * alignment
 
 
@@ -95,6 +101,8 @@ def _pad_deepseek_v4_tensor(
     fill_value: float = 0.0,
     fill_e8m0_identity: bool = False,
 ) -> torch.Tensor:
+    if dim >= loaded_weight.ndim:
+        return loaded_weight
     if loaded_weight.shape[dim] == target_size:
         return loaded_weight
     if loaded_weight.shape[dim] > target_size:
@@ -1362,14 +1370,20 @@ class DeepseekV4Model(nn.Module):
         if weight_block_size is None or len(weight_block_size) < 2:
             return loaded_weight
         block_n, block_k = int(weight_block_size[0]), int(weight_block_size[1])
-        is_weight_scale = ".weight_scale_inv" in name or name.endswith(".scale")
+        if block_n <= 0 or block_k <= 0:
+            return loaded_weight
+        is_weight_scale = ".weight_scale" in name or name.endswith(".scale")
 
         if ".shared_experts.gate_up_proj." in name:
             dim = 0
-            target_size = _ceil_div(padded_size, block_n) if is_weight_scale else padded_size
+            target_size = (
+                _ceil_div(padded_size, block_n) if is_weight_scale else padded_size
+            )
         elif ".shared_experts.down_proj." in name:
             dim = 1
-            target_size = _ceil_div(padded_size, block_k) if is_weight_scale else padded_size
+            target_size = (
+                _ceil_div(padded_size, block_k) if is_weight_scale else padded_size
+            )
         else:
             return loaded_weight
 
@@ -1421,6 +1435,9 @@ class DeepseekV4Model(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
+                loaded_weight = self._maybe_pad_shared_experts_weight(
+                    name, loaded_weight
+                )
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -1470,6 +1487,9 @@ class DeepseekV4Model(nn.Module):
                     loaded_params.add(name)
                     continue
                 else:
+                    loaded_weight = self._maybe_pad_shared_experts_weight(
+                        name, loaded_weight
+                    )
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
