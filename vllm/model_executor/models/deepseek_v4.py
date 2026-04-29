@@ -125,6 +125,63 @@ def _pad_deepseek_v4_tensor(
     return padded
 
 
+def _maybe_pad_deepseek_v4_shared_experts_weight(
+    config: typing.Any,
+    quant_config: QuantizationConfig | None,
+    name: str,
+    loaded_weight: torch.Tensor,
+    tp_size: int,
+) -> torch.Tensor:
+    if ".shared_experts." not in name or loaded_weight.ndim < 2:
+        return loaded_weight
+
+    n_shared_experts = getattr(config, "n_shared_experts", None)
+    if n_shared_experts is None:
+        return loaded_weight
+    original_size = config.moe_intermediate_size * n_shared_experts
+    padded_size = _padded_moe_intermediate_size(original_size, quant_config, tp_size)
+    if original_size == padded_size:
+        return loaded_weight
+
+    weight_block_size = getattr(quant_config, "weight_block_size", None)
+    if weight_block_size is None or len(weight_block_size) < 2:
+        return loaded_weight
+    block_n, block_k = int(weight_block_size[0]), int(weight_block_size[1])
+    if block_n <= 0 or block_k <= 0:
+        return loaded_weight
+    is_weight_scale = ".weight_scale" in name or name.endswith(".scale")
+
+    if ".shared_experts.gate_up_proj." in name:
+        dim = 0
+        target_size = (
+            _ceil_div(padded_size, block_n) if is_weight_scale else padded_size
+        )
+    elif ".shared_experts.down_proj." in name:
+        dim = 1
+        target_size = (
+            _ceil_div(padded_size, block_k) if is_weight_scale else padded_size
+        )
+    else:
+        return loaded_weight
+
+    expected_size = (
+        _ceil_div(original_size, block_n if dim == 0 else block_k)
+        if is_weight_scale
+        else original_size
+    )
+    if loaded_weight.shape[dim] != expected_size:
+        return loaded_weight
+
+    return _pad_deepseek_v4_tensor(
+        loaded_weight,
+        dim,
+        target_size,
+        fill_value=1.0 if is_weight_scale else 0.0,
+        fill_e8m0_identity=is_weight_scale
+        and loaded_weight.dtype == torch.float8_e8m0fnu,
+    )
+
+
 class DeepseekV4MLP(nn.Module):
     def __init__(
         self,
@@ -844,6 +901,9 @@ class DeepseekV4MoE(nn.Module):
         self.experts_start_idx = self.tp_rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
 
+        # Keep routed experts at the checkpoint intermediate size. DeepSeek V4's
+        # FP8 config routes FusedMoE to the MXFP4 MoE backend, so the TP16 FP8
+        # block-shape padding is only needed for the shared linear experts.
         self.experts = FusedMoE(
             shared_experts=self.shared_experts,
             gate=self.gate,
@@ -1346,61 +1406,15 @@ class DeepseekV4Model(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
-    def _shared_experts_intermediate_sizes(self) -> tuple[int, int]:
-        n_shared_experts = getattr(self.config, "n_shared_experts", None)
-        if n_shared_experts is None:
-            return 0, 0
-        original_size = self.config.moe_intermediate_size * n_shared_experts
-        padded_size = _padded_moe_intermediate_size(
-            original_size, self.quant_config, get_tensor_model_parallel_world_size()
-        )
-        return original_size, padded_size
-
     def _maybe_pad_shared_experts_weight(
         self, name: str, loaded_weight: torch.Tensor
     ) -> torch.Tensor:
-        if ".shared_experts." not in name or loaded_weight.ndim < 2:
-            return loaded_weight
-
-        original_size, padded_size = self._shared_experts_intermediate_sizes()
-        if original_size == padded_size:
-            return loaded_weight
-
-        weight_block_size = getattr(self.quant_config, "weight_block_size", None)
-        if weight_block_size is None or len(weight_block_size) < 2:
-            return loaded_weight
-        block_n, block_k = int(weight_block_size[0]), int(weight_block_size[1])
-        if block_n <= 0 or block_k <= 0:
-            return loaded_weight
-        is_weight_scale = ".weight_scale" in name or name.endswith(".scale")
-
-        if ".shared_experts.gate_up_proj." in name:
-            dim = 0
-            target_size = (
-                _ceil_div(padded_size, block_n) if is_weight_scale else padded_size
-            )
-        elif ".shared_experts.down_proj." in name:
-            dim = 1
-            target_size = (
-                _ceil_div(padded_size, block_k) if is_weight_scale else padded_size
-            )
-        else:
-            return loaded_weight
-
-        if loaded_weight.shape[dim] != (
-            _ceil_div(original_size, block_n if dim == 0 else block_k)
-            if is_weight_scale
-            else original_size
-        ):
-            return loaded_weight
-
-        return _pad_deepseek_v4_tensor(
+        return _maybe_pad_deepseek_v4_shared_experts_weight(
+            self.config,
+            self.quant_config,
+            name,
             loaded_weight,
-            dim,
-            target_size,
-            fill_value=1.0 if is_weight_scale else 0.0,
-            fill_e8m0_identity=is_weight_scale
-            and loaded_weight.dtype == torch.float8_e8m0fnu,
+            get_tensor_model_parallel_world_size(),
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
