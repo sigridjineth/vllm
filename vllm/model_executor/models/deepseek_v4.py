@@ -126,6 +126,133 @@ def _pad_deepseek_v4_tensor(
     return padded
 
 
+def _balanced_tp_block_indices(
+    original_blocks: int,
+    padded_blocks: int,
+    tp_size: int,
+) -> list[int]:
+    if (
+        original_blocks <= 0
+        or padded_blocks <= 0
+        or original_blocks > padded_blocks
+        or tp_size <= 0
+        or padded_blocks % tp_size != 0
+    ):
+        return list(range(original_blocks))
+
+    blocks_per_partition = padded_blocks // tp_size
+    if blocks_per_partition <= 0:
+        return list(range(original_blocks))
+
+    base_blocks_per_partition = original_blocks // tp_size
+    extra_partitions = original_blocks % tp_size
+    if base_blocks_per_partition > blocks_per_partition:
+        return list(range(original_blocks))
+
+    # Spread the partitions that receive one extra checkpoint block across
+    # tensor-parallel ranks instead of appending all padding to the final ranks.
+    # For DeepSeek V4 Pro at TP=16 this maps 24 original FP8 blocks into
+    # 32 padded blocks as:
+    #   [0, 1], [2, pad], [3, 4], [5, pad], ...
+    # This preserves the checkpoint block order while avoiding four ranks
+    # with a completely zero shared-expert shard on 2-node TP=16 runs.
+    extra_partition_indices = (
+        {(i * tp_size) // extra_partitions for i in range(extra_partitions)}
+        if extra_partitions
+        else set()
+    )
+
+    block_indices: list[int] = []
+    for partition in range(tp_size):
+        partition_blocks = base_blocks_per_partition
+        if partition in extra_partition_indices:
+            partition_blocks += 1
+        if partition_blocks > blocks_per_partition:
+            return list(range(original_blocks))
+        start = partition * blocks_per_partition
+        block_indices.extend(start + offset for offset in range(partition_blocks))
+
+    if len(block_indices) != original_blocks:
+        return list(range(original_blocks))
+    return block_indices
+
+
+def _pad_deepseek_v4_tensor_by_tp_blocks(
+    loaded_weight: torch.Tensor,
+    dim: int,
+    target_size: int,
+    *,
+    block_size: int,
+    tp_size: int,
+    fill_value: float = 0.0,
+    fill_e8m0_identity: bool = False,
+) -> torch.Tensor:
+    if (
+        dim >= loaded_weight.ndim
+        or block_size <= 0
+        or loaded_weight.shape[dim] == target_size
+    ):
+        return _pad_deepseek_v4_tensor(
+            loaded_weight,
+            dim,
+            target_size,
+            fill_value=fill_value,
+            fill_e8m0_identity=fill_e8m0_identity,
+        )
+    if loaded_weight.shape[dim] > target_size:
+        raise ValueError(
+            f"Cannot pad DeepSeek V4 tensor dimension {dim} from "
+            f"{loaded_weight.shape[dim]} down to {target_size}."
+        )
+    if loaded_weight.shape[dim] % block_size != 0 or target_size % block_size != 0:
+        return _pad_deepseek_v4_tensor(
+            loaded_weight,
+            dim,
+            target_size,
+            fill_value=fill_value,
+            fill_e8m0_identity=fill_e8m0_identity,
+        )
+
+    original_blocks = loaded_weight.shape[dim] // block_size
+    padded_blocks = target_size // block_size
+    block_indices = _balanced_tp_block_indices(
+        original_blocks,
+        padded_blocks,
+        tp_size,
+    )
+    if block_indices == list(range(original_blocks)):
+        return _pad_deepseek_v4_tensor(
+            loaded_weight,
+            dim,
+            target_size,
+            fill_value=fill_value,
+            fill_e8m0_identity=fill_e8m0_identity,
+        )
+
+    padded_shape = list(loaded_weight.shape)
+    padded_shape[dim] = target_size
+    padded = loaded_weight.new_empty(padded_shape)
+    if fill_e8m0_identity:
+        padded.view(torch.uint8).fill_(127)
+    else:
+        padded.fill_(fill_value)
+
+    src_slices = [slice(None)] * loaded_weight.ndim
+    dst_slices = [slice(None)] * loaded_weight.ndim
+    for src_block, dst_block in enumerate(block_indices):
+        src_slices[dim] = slice(
+            src_block * block_size,
+            (src_block + 1) * block_size,
+        )
+        dst_slices[dim] = slice(
+            dst_block * block_size,
+            (dst_block + 1) * block_size,
+        )
+        padded[tuple(dst_slices)].copy_(loaded_weight[tuple(src_slices)])
+
+    return padded
+
+
 def _maybe_pad_deepseek_v4_intermediate_tensor(
     *,
     original_size: int,
@@ -135,6 +262,7 @@ def _maybe_pad_deepseek_v4_intermediate_tensor(
     loaded_weight: torch.Tensor,
     gate_up_markers: tuple[str, ...],
     down_markers: tuple[str, ...],
+    tp_size: int,
 ) -> torch.Tensor:
     if loaded_weight.ndim < 2 or original_size == padded_size:
         return loaded_weight
@@ -161,11 +289,19 @@ def _maybe_pad_deepseek_v4_intermediate_tensor(
     if loaded_weight.shape[dim] != expected_size:
         return loaded_weight
 
-    target_size = _ceil_div(padded_size, block_size) if is_weight_scale else padded_size
-    return _pad_deepseek_v4_tensor(
+    if is_weight_scale:
+        target_size = _ceil_div(padded_size, block_size)
+        tensor_block_size = 1
+    else:
+        target_size = padded_size
+        tensor_block_size = block_size
+
+    return _pad_deepseek_v4_tensor_by_tp_blocks(
         loaded_weight,
         dim,
         target_size,
+        block_size=tensor_block_size,
+        tp_size=tp_size,
         fill_value=1.0 if is_weight_scale else 0.0,
         fill_e8m0_identity=is_weight_scale
         and loaded_weight.dtype == torch.float8_e8m0fnu,
@@ -196,6 +332,7 @@ def _maybe_pad_deepseek_v4_shared_experts_weight(
         loaded_weight=loaded_weight,
         gate_up_markers=(".shared_experts.gate_up_proj.",),
         down_markers=(".shared_experts.down_proj.",),
+        tp_size=tp_size,
     )
 
 
@@ -222,6 +359,7 @@ def _maybe_pad_deepseek_v4_routed_experts_weight(
         loaded_weight=loaded_weight,
         gate_up_markers=(".w1.", ".w3."),
         down_markers=(".w2.",),
+        tp_size=tp_size,
     )
 
 

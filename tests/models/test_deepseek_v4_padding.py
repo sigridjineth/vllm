@@ -15,7 +15,9 @@ from vllm.model_executor.models.deepseek_v4 import (
     DeepseekV4MLP,
     DeepseekV4Model,
     DeepseekV4MoE,
+    _balanced_tp_block_indices,
     _pad_deepseek_v4_tensor,
+    _pad_deepseek_v4_tensor_by_tp_blocks,
     _padded_moe_intermediate_size,
 )
 from vllm.model_executor.models.deepseek_v4_mtp import DeepSeekV4MTP
@@ -62,6 +64,46 @@ def _deepseek_v4_moe_config(*, expert_dtype: str = "fp4") -> SimpleNamespace:
     )
 
 
+def _assert_tp_balanced_padding(
+    padded: torch.Tensor,
+    original: torch.Tensor,
+    *,
+    dim: int,
+    block_size: int,
+    fill_value: int | float,
+    tp_size: int = 16,
+) -> None:
+    original_blocks = original.shape[dim] // block_size
+    padded_blocks = padded.shape[dim] // block_size
+    block_indices = _balanced_tp_block_indices(
+        original_blocks,
+        padded_blocks,
+        tp_size,
+    )
+
+    src_slices = [slice(None)] * original.ndim
+    dst_slices = [slice(None)] * padded.ndim
+    for src_block, dst_block in enumerate(block_indices):
+        src_slices[dim] = slice(
+            src_block * block_size,
+            (src_block + 1) * block_size,
+        )
+        dst_slices[dim] = slice(
+            dst_block * block_size,
+            (dst_block + 1) * block_size,
+        )
+        assert torch.equal(padded[tuple(dst_slices)], original[tuple(src_slices)])
+
+    padded_block_set = set(range(padded_blocks))
+    original_block_set = set(block_indices)
+    for dst_block in padded_block_set - original_block_set:
+        dst_slices[dim] = slice(
+            dst_block * block_size,
+            (dst_block + 1) * block_size,
+        )
+        assert torch.all(padded[tuple(dst_slices)] == fill_value)
+
+
 def test_padded_moe_intermediate_size_only_pads_misaligned_fp8_tp():
     quant_config = _fp8_block_config()
 
@@ -90,6 +132,85 @@ def test_pad_deepseek_v4_tensor_rejects_truncation():
         _pad_deepseek_v4_tensor(weight, dim=1, target_size=2)
 
 
+def test_balanced_tp_block_padding_spreads_zero_blocks_across_ranks():
+    assert _balanced_tp_block_indices(24, 32, 16) == [
+        0,
+        1,
+        2,
+        4,
+        5,
+        6,
+        8,
+        9,
+        10,
+        12,
+        13,
+        14,
+        16,
+        17,
+        18,
+        20,
+        21,
+        22,
+        24,
+        25,
+        26,
+        28,
+        29,
+        30,
+    ]
+
+    weight = torch.arange(24, dtype=torch.float32).reshape(24, 1)
+    padded = _pad_deepseek_v4_tensor_by_tp_blocks(
+        weight,
+        dim=0,
+        target_size=32,
+        block_size=1,
+        tp_size=16,
+        fill_value=-1.0,
+    )
+
+    _assert_tp_balanced_padding(
+        padded,
+        weight,
+        dim=0,
+        block_size=1,
+        fill_value=-1.0,
+    )
+
+
+def test_balanced_tp_block_padding_preserves_linear_round_trip():
+    hidden_size = 5
+    original_intermediate_size = 3
+    padded_intermediate_size = 4
+
+    hidden_states = torch.randn(2, hidden_size)
+    gate_up_weight = torch.randn(original_intermediate_size, hidden_size)
+    down_weight = torch.randn(hidden_size, original_intermediate_size)
+
+    original_output = hidden_states.matmul(gate_up_weight.t()).matmul(down_weight.t())
+
+    padded_gate_up_weight = _pad_deepseek_v4_tensor_by_tp_blocks(
+        gate_up_weight,
+        dim=0,
+        target_size=padded_intermediate_size,
+        block_size=1,
+        tp_size=2,
+    )
+    padded_down_weight = _pad_deepseek_v4_tensor_by_tp_blocks(
+        down_weight,
+        dim=1,
+        target_size=padded_intermediate_size,
+        block_size=1,
+        tp_size=2,
+    )
+    padded_output = hidden_states.matmul(padded_gate_up_weight.t()).matmul(
+        padded_down_weight.t()
+    )
+
+    torch.testing.assert_close(padded_output, original_output)
+
+
 def test_shared_experts_loader_padding_for_gate_up_and_down(monkeypatch):
     if not hasattr(torch, "float8_e4m3fn"):
         pytest.skip("torch build does not expose float8_e4m3fn")
@@ -103,10 +224,13 @@ def test_shared_experts_loader_padding_for_gate_up_and_down(monkeypatch):
         gate_up,
     )
     assert padded_gate_up.shape == (4096, 7168)
-    assert torch.equal(
-        padded_gate_up[:3072].view(torch.uint8), gate_up.view(torch.uint8)
+    _assert_tp_balanced_padding(
+        padded_gate_up.view(torch.uint8),
+        gate_up.view(torch.uint8),
+        dim=0,
+        block_size=128,
+        fill_value=0,
     )
-    assert torch.count_nonzero(padded_gate_up[3072:].view(torch.uint8)) == 0
 
     down = torch.ones((7168, 3072), dtype=torch.float8_e4m3fn)
     padded_down = model._maybe_pad_shared_experts_weight(
@@ -114,8 +238,13 @@ def test_shared_experts_loader_padding_for_gate_up_and_down(monkeypatch):
         down,
     )
     assert padded_down.shape == (7168, 4096)
-    assert torch.equal(padded_down[:, :3072].view(torch.uint8), down.view(torch.uint8))
-    assert torch.count_nonzero(padded_down[:, 3072:].view(torch.uint8)) == 0
+    _assert_tp_balanced_padding(
+        padded_down.view(torch.uint8),
+        down.view(torch.uint8),
+        dim=1,
+        block_size=128,
+        fill_value=0,
+    )
 
 
 def test_shared_experts_scale_loader_padding_uses_e8m0_identity(monkeypatch):
@@ -131,10 +260,13 @@ def test_shared_experts_scale_loader_padding_uses_e8m0_identity(monkeypatch):
         gate_up_scale,
     )
     assert padded_gate_up_scale.shape == (32, 56)
-    assert torch.equal(
-        padded_gate_up_scale[:24].view(torch.uint8), gate_up_scale.view(torch.uint8)
+    _assert_tp_balanced_padding(
+        padded_gate_up_scale.view(torch.uint8),
+        gate_up_scale.view(torch.uint8),
+        dim=0,
+        block_size=1,
+        fill_value=127,
     )
-    assert torch.all(padded_gate_up_scale[24:].view(torch.uint8) == 127)
 
     down_scale = torch.ones((56, 24), dtype=torch.float8_e8m0fnu)
     padded_down_scale = model._maybe_pad_shared_experts_weight(
@@ -142,10 +274,13 @@ def test_shared_experts_scale_loader_padding_uses_e8m0_identity(monkeypatch):
         down_scale,
     )
     assert padded_down_scale.shape == (56, 32)
-    assert torch.equal(
-        padded_down_scale[:, :24].view(torch.uint8), down_scale.view(torch.uint8)
+    _assert_tp_balanced_padding(
+        padded_down_scale.view(torch.uint8),
+        down_scale.view(torch.uint8),
+        dim=1,
+        block_size=1,
+        fill_value=127,
     )
-    assert torch.all(padded_down_scale[:, 24:].view(torch.uint8) == 127)
 
 
 def test_routed_fp8_experts_loader_padding_for_gate_up_and_down(monkeypatch):
@@ -162,8 +297,13 @@ def test_routed_fp8_experts_loader_padding_for_gate_up_and_down(monkeypatch):
         w1,
     )
     assert padded_w1.shape == (4096, 7168)
-    assert torch.equal(padded_w1[:3072].view(torch.uint8), w1.view(torch.uint8))
-    assert torch.count_nonzero(padded_w1[3072:].view(torch.uint8)) == 0
+    _assert_tp_balanced_padding(
+        padded_w1.view(torch.uint8),
+        w1.view(torch.uint8),
+        dim=0,
+        block_size=128,
+        fill_value=0,
+    )
 
     w2 = torch.ones((7168, 3072), dtype=torch.float8_e4m3fn)
     padded_w2 = model._maybe_pad_routed_experts_weight(
@@ -171,8 +311,13 @@ def test_routed_fp8_experts_loader_padding_for_gate_up_and_down(monkeypatch):
         w2,
     )
     assert padded_w2.shape == (7168, 4096)
-    assert torch.equal(padded_w2[:, :3072].view(torch.uint8), w2.view(torch.uint8))
-    assert torch.count_nonzero(padded_w2[:, 3072:].view(torch.uint8)) == 0
+    _assert_tp_balanced_padding(
+        padded_w2.view(torch.uint8),
+        w2.view(torch.uint8),
+        dim=1,
+        block_size=128,
+        fill_value=0,
+    )
 
 
 def test_routed_fp8_experts_scale_padding_uses_float_identity(monkeypatch):
@@ -186,8 +331,13 @@ def test_routed_fp8_experts_scale_padding_uses_float_identity(monkeypatch):
         w1_scale,
     )
     assert padded_w1_scale.shape == (32, 56)
-    torch.testing.assert_close(padded_w1_scale[:24], w1_scale)
-    torch.testing.assert_close(padded_w1_scale[24:], torch.ones((8, 56)))
+    _assert_tp_balanced_padding(
+        padded_w1_scale,
+        w1_scale,
+        dim=0,
+        block_size=1,
+        fill_value=1.0,
+    )
 
     w2_scale = torch.ones((56, 24), dtype=torch.float32)
     padded_w2_scale = model._maybe_pad_routed_experts_weight(
@@ -195,8 +345,13 @@ def test_routed_fp8_experts_scale_padding_uses_float_identity(monkeypatch):
         w2_scale,
     )
     assert padded_w2_scale.shape == (56, 32)
-    torch.testing.assert_close(padded_w2_scale[:, :24], w2_scale)
-    torch.testing.assert_close(padded_w2_scale[:, 24:], torch.ones((56, 8)))
+    _assert_tp_balanced_padding(
+        padded_w2_scale,
+        w2_scale,
+        dim=1,
+        block_size=1,
+        fill_value=1.0,
+    )
 
 
 def test_mtp_shared_experts_loader_reuses_tp16_padding(monkeypatch):
@@ -214,10 +369,13 @@ def test_mtp_shared_experts_loader_reuses_tp16_padding(monkeypatch):
         gate_up,
     )
     assert padded_gate_up.shape == (4096, 7168)
-    assert torch.equal(
-        padded_gate_up[:3072].view(torch.uint8), gate_up.view(torch.uint8)
+    _assert_tp_balanced_padding(
+        padded_gate_up.view(torch.uint8),
+        gate_up.view(torch.uint8),
+        dim=0,
+        block_size=128,
+        fill_value=0,
     )
-    assert torch.count_nonzero(padded_gate_up[3072:].view(torch.uint8)) == 0
 
     down = torch.ones((7168, 3072), dtype=torch.float8_e4m3fn)
     padded_down = model._maybe_pad_shared_experts_weight(
@@ -225,8 +383,13 @@ def test_mtp_shared_experts_loader_reuses_tp16_padding(monkeypatch):
         down,
     )
     assert padded_down.shape == (7168, 4096)
-    assert torch.equal(padded_down[:, :3072].view(torch.uint8), down.view(torch.uint8))
-    assert torch.count_nonzero(padded_down[:, 3072:].view(torch.uint8)) == 0
+    _assert_tp_balanced_padding(
+        padded_down.view(torch.uint8),
+        down.view(torch.uint8),
+        dim=1,
+        block_size=128,
+        fill_value=0,
+    )
 
 
 def test_mtp_shared_experts_scale_padding_uses_e8m0_identity(monkeypatch):
@@ -245,10 +408,13 @@ def test_mtp_shared_experts_scale_padding_uses_e8m0_identity(monkeypatch):
     )
 
     assert padded_down_scale.shape == (56, 32)
-    assert torch.equal(
-        padded_down_scale[:, :24].view(torch.uint8), down_scale.view(torch.uint8)
+    _assert_tp_balanced_padding(
+        padded_down_scale.view(torch.uint8),
+        down_scale.view(torch.uint8),
+        dim=1,
+        block_size=1,
+        fill_value=127,
     )
-    assert torch.all(padded_down_scale[:, 24:].view(torch.uint8) == 127)
 
 
 def test_tp16_fp8_shared_experts_mlp_requires_padded_intermediate(monkeypatch):
