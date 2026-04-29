@@ -66,6 +66,57 @@ from .utils import (
 )
 
 
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _padded_moe_intermediate_size(
+    intermediate_size: int,
+    quant_config: QuantizationConfig | None,
+    tp_size: int,
+) -> int:
+    if not isinstance(quant_config, Fp8Config):
+        return intermediate_size
+    weight_block_size = getattr(quant_config, "weight_block_size", None)
+    if weight_block_size is None or len(weight_block_size) < 2:
+        return intermediate_size
+    block_k = int(weight_block_size[1])
+    alignment = tp_size * block_k
+    if alignment <= 0:
+        return intermediate_size
+    return _ceil_div(intermediate_size, alignment) * alignment
+
+
+def _pad_deepseek_v4_tensor(
+    loaded_weight: torch.Tensor,
+    dim: int,
+    target_size: int,
+    *,
+    fill_value: float = 0.0,
+    fill_e8m0_identity: bool = False,
+) -> torch.Tensor:
+    if loaded_weight.shape[dim] == target_size:
+        return loaded_weight
+    if loaded_weight.shape[dim] > target_size:
+        raise ValueError(
+            f"Cannot pad DeepSeek V4 tensor dimension {dim} from "
+            f"{loaded_weight.shape[dim]} down to {target_size}."
+        )
+
+    padded_shape = list(loaded_weight.shape)
+    padded_shape[dim] = target_size
+    padded = loaded_weight.new_empty(padded_shape)
+    if fill_e8m0_identity:
+        padded.view(torch.uint8).fill_(127)
+    else:
+        padded.fill_(fill_value)
+
+    slices = [slice(None)] * loaded_weight.ndim
+    slices[dim] = slice(0, loaded_weight.shape[dim])
+    padded[tuple(slices)].copy_(loaded_weight)
+    return padded
+
+
 class DeepseekV4MLP(nn.Module):
     def __init__(
         self,
@@ -682,6 +733,7 @@ class DeepseekV4MoE(nn.Module):
         self.n_routed_experts = config.n_routed_experts
         self.n_activated_experts = config.num_experts_per_tok
         self.moe_intermediate_size = config.moe_intermediate_size
+        self.shared_experts_intermediate_size: int | None = None
         self.swiglu_limit = config.swiglu_limit
         self.renormalize = config.norm_topk_prob
         self.scoring_func = getattr(config, "scoring_func", "sqrtsoftplus")
@@ -725,6 +777,10 @@ class DeepseekV4MoE(nn.Module):
             self.shared_experts = None
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            intermediate_size = _padded_moe_intermediate_size(
+                intermediate_size, quant_config, self.tp_size
+            )
+            self.shared_experts_intermediate_size = intermediate_size
 
             self.shared_experts = DeepseekV4MLP(
                 hidden_size=config.hidden_size,
@@ -1175,6 +1231,7 @@ class DeepseekV4Model(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
+        self.quant_config = quant_config
 
         self.vocab_size = config.vocab_size
         self.hc_eps = config.hc_eps
@@ -1280,6 +1337,57 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.norm(hidden_states)
         return hidden_states
+
+    def _shared_experts_intermediate_sizes(self) -> tuple[int, int]:
+        n_shared_experts = getattr(self.config, "n_shared_experts", None)
+        if n_shared_experts is None:
+            return 0, 0
+        original_size = self.config.moe_intermediate_size * n_shared_experts
+        padded_size = _padded_moe_intermediate_size(
+            original_size, self.quant_config, get_tensor_model_parallel_world_size()
+        )
+        return original_size, padded_size
+
+    def _maybe_pad_shared_experts_weight(
+        self, name: str, loaded_weight: torch.Tensor
+    ) -> torch.Tensor:
+        if ".shared_experts." not in name or loaded_weight.ndim < 2:
+            return loaded_weight
+
+        original_size, padded_size = self._shared_experts_intermediate_sizes()
+        if original_size == padded_size:
+            return loaded_weight
+
+        weight_block_size = getattr(self.quant_config, "weight_block_size", None)
+        if weight_block_size is None or len(weight_block_size) < 2:
+            return loaded_weight
+        block_n, block_k = int(weight_block_size[0]), int(weight_block_size[1])
+        is_weight_scale = ".weight_scale_inv" in name or name.endswith(".scale")
+
+        if ".shared_experts.gate_up_proj." in name:
+            dim = 0
+            target_size = _ceil_div(padded_size, block_n) if is_weight_scale else padded_size
+        elif ".shared_experts.down_proj." in name:
+            dim = 1
+            target_size = _ceil_div(padded_size, block_k) if is_weight_scale else padded_size
+        else:
+            return loaded_weight
+
+        if loaded_weight.shape[dim] != (
+            _ceil_div(original_size, block_n if dim == 0 else block_k)
+            if is_weight_scale
+            else original_size
+        ):
+            return loaded_weight
+
+        return _pad_deepseek_v4_tensor(
+            loaded_weight,
+            dim,
+            target_size,
+            fill_value=1.0 if is_weight_scale else 0.0,
+            fill_e8m0_identity=is_weight_scale
+            and loaded_weight.dtype == torch.float8_e8m0fnu,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
